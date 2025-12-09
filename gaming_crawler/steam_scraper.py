@@ -18,9 +18,11 @@ def scrape_steam_games(max_games=10):
     """
     # Setup Chrome driver with options
     options = webdriver.ChromeOptions()
+    options.add_argument('--headless')  # Run browser in background (no window)
     options.add_argument('--disable-blink-features=AutomationControlled')
     options.add_argument('--no-sandbox')
     options.add_argument('--disable-dev-shm-usage')
+    options.add_argument('--disable-gpu')
     
     service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=options)
@@ -165,7 +167,7 @@ def scrape_steam_games(max_games=10):
         os.makedirs("scraped_data", exist_ok=True)
         
         df = pd.DataFrame(game_data)
-        output_file = "scraped_data/steam_games_new.csv"
+        output_file = "scraped_data/steam_games.csv"
         df.to_csv(output_file, index=False, encoding='utf-8-sig')
         print(f"\n✓ Successfully scraped {len(game_data)} games and saved to {output_file}")
         
