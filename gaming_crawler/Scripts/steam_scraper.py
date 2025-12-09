@@ -475,6 +475,7 @@ def scrape_page_range(worker_id, start_page, end_page, scrape_details=True, down
     return local_data
 
 def scrape_steam_games(max_games=100, num_workers=5, scrape_details=True, download_media_files=True):
+    """Scrape Steam games using multithreading."""
     global all_game_data
     all_game_data = []
     
@@ -538,7 +539,7 @@ def scrape_steam_games(max_games=100, num_workers=5, scrape_details=True, downlo
 
 if __name__ == "__main__":
     # Full scrape with media (start small!)
-    scrape_steam_games(max_games=50, num_workers=5, scrape_details=True, download_media_files=True)
-    
+    scrape_steam_games(max_games=1200, num_workers=25, scrape_details=True, download_media_files=True)
+    # Increase number of workers above for faster scraping on powerful machines
     # Quick scrape
-    # scrape_steam_games(max_games=1000, num_workers=10, scrape_details=False, download_media_files=False)
+    # scrape_steam_games(max_games=1000, num_workers=10, scrape_details=False, download_media_files=False)W
