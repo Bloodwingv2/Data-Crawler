@@ -1,0 +1,11 @@
+[project]
+name = "Gaming-crawler"
+version = "0.1.0"
+description = "Experimental web crawler for gaming websites using Selenium."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "pandas>=2.3.3",
+    "selenium>=4.39.0",
+    "webdriver-manager>=4.0.2",
+]
