@@ -31,6 +31,17 @@ def create_driver():
 
 def download_media(url, save_dir, filename):
     try:
+        # Special handling for video manifests (m3u8, mpd)
+        if url.endswith('.m3u8') or url.endswith('.mpd'):
+            # Save the manifest URL to a text file instead
+            filepath = os.path.join(save_dir, filename.replace('.mp4', '.txt').replace('.webm', '.txt'))
+            with open(filepath, 'w') as f:
+                f.write(f"Video Manifest URL:\n{url}\n\n")
+                f.write("Note: This is an HLS/DASH manifest. Use a video player that supports streaming (VLC, ffmpeg) to download/play.\n")
+                f.write(f"\nTo download with ffmpeg:\nffmpeg -i \"{url}\" -c copy \"{filename.replace('.txt', '.mp4')}\"\n")
+            return filepath
+        
+        # Regular download for images and direct video files
         response = requests.get(url, timeout=15, stream=True, headers={
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         })
@@ -59,67 +70,191 @@ def handle_age_gate(driver):
     except:
         pass
 
+def convert_hls_to_direct_url(hls_url):
+    """Convert HLS manifest URL to direct video URLs."""
+    try:
+        # Pattern: https://video.akamai.steamstatic.com/store_trailers/252490/824633/.../hls_264_master.m3u8
+        # Steam structure: base_url + video_id + hash + timestamp + filename
+        
+        # Remove the HLS filename and query params
+        base_url = hls_url.split('/hls_')[0] + '/'
+        
+        # Try multiple formats that Steam commonly uses
+        possible_formats = [
+            base_url + 'movie_max_vp9.webm',      # Highest quality VP9
+            base_url + 'movie480_vp9.webm',       # Standard VP9
+            base_url + 'movie_max.webm',          # Highest quality
+            base_url + 'movie480.webm',           # Standard WebM
+            base_url + 'movie_max.mp4',           # Highest quality MP4
+            base_url + 'movie480.mp4',            # Standard MP4
+            hls_url  # Keep original as fallback
+        ]
+        
+        return possible_formats
+    except:
+        return [hls_url]
+
 def extract_video_urls(driver):
-    """Extract video URLs from Steam's video player data."""
+    """Extract game trailer URLs from Steam's JSON data-props and embedded videos."""
     video_urls = []
     try:
-        # Method 1: Look for video data in page source
-        page_source = driver.page_source
+        # Wait for the page to fully load
+        time.sleep(3)
         
-        # Find MP4 and WEBM URLs in the page source
-        mp4_pattern = r'(https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*)'
-        webm_pattern = r'(https?://[^\s"\'<>]+\.webm[^\s"\'<>]*)'
-        
-        mp4_urls = re.findall(mp4_pattern, page_source)
-        webm_urls = re.findall(webm_pattern, page_source)
-        
-        # Prefer HD versions
-        for url in mp4_urls + webm_urls:
-            if 'cdn.akamai.steamstatic.com' in url or 'cdn.cloudflare.steamstatic.com' in url:
-                if url not in video_urls:
-                    video_urls.append(url)
-        
-        # Method 2: Check for highlight_player_item data
+        # Method 0: Extract embedded videos from game description (BEST - actual video files!)
         try:
-            video_elements = driver.find_elements(By.CSS_SELECTOR, ".highlight_player_item")
-            for elem in video_elements:
+            # Find all <video> tags with <source> elements
+            video_elements = driver.find_elements(By.CSS_SELECTOR, "video source[src*='.webm'], video source[src*='.mp4']")
+            
+            for video_elem in video_elements[:3]:  # Limit to 3
                 try:
-                    onclick = elem.get_attribute("onclick")
-                    if onclick:
-                        # Extract video ID from onclick
-                        match = re.search(r'(\d+)', onclick)
-                        if match:
-                            video_id = match.group(1)
-                            # Try to construct video URL
-                            potential_urls = [
-                                f"https://cdn.akamai.steamstatic.com/steam/apps/{video_id}/movie480.webm",
-                                f"https://cdn.akamai.steamstatic.com/steam/apps/{video_id}/movie480.mp4",
-                                f"https://cdn.cloudflare.steamstatic.com/steam/apps/{video_id}/movie480.webm",
-                                f"https://cdn.cloudflare.steamstatic.com/steam/apps/{video_id}/movie480.mp4"
-                            ]
-                            for url in potential_urls:
-                                if url not in video_urls:
-                                    video_urls.append(url)
+                    video_url = video_elem.get_attribute("src")
+                    if video_url and 'store_item_assets' in video_url:
+                        # These are direct video files from game description
+                        video_urls.append(video_url)
+                        print(f"   Found embedded video: {video_url[:100]}...")
                 except:
                     continue
-        except:
-            pass
+            
+            if video_urls:
+                print(f"   Total embedded videos: {len(video_urls)}")
+        except Exception as e:
+            print(f"   Embedded video search error: {e}")
         
-        # Method 3: Check data attributes on movie elements
-        try:
-            movie_elements = driver.find_elements(By.CSS_SELECTOR, "[data-webm-source], [data-mp4-source], [data-webm-hd-source], [data-mp4-hd-source]")
-            for elem in movie_elements:
-                for attr in ['data-webm-hd-source', 'data-mp4-hd-source', 'data-webm-source', 'data-mp4-source']:
-                    url = elem.get_attribute(attr)
-                    if url and url not in video_urls:
+        # Method 1: Parse the data-props JSON for trailers
+        if len(video_urls) < 3:
+            try:
+                selectors = [
+                    ".gamehighlight_desktopcarousel[data-props]",
+                    "[data-featuretarget='gamehighlight-desktopcarousel'][data-props]",
+                    "div[data-props*='trailers']",
+                    "[class*='gamehighlight'][data-props]"
+                ]
+                
+                carousel = None
+                for selector in selectors:
+                    try:
+                        carousel = driver.find_element(By.CSS_SELECTOR, selector)
+                        if carousel:
+                            break
+                    except:
+                        continue
+                
+                if carousel:
+                    data_props = carousel.get_attribute("data-props")
+                    
+                    if data_props:
+                        # Unescape HTML entities
+                        data_props = data_props.replace('&quot;', '"').replace('&amp;', '&').replace('\\/', '/')
+                        
+                        # Parse the JSON data
+                        data = json.loads(data_props)
+                        
+                        # Extract trailer URLs from the "trailers" array
+                        if "trailers" in data and isinstance(data["trailers"], list):
+                            for trailer in data["trailers"][:3]:
+                                # Get HLS manifest and convert to direct URLs
+                                if "hlsManifest" in trailer and trailer["hlsManifest"]:
+                                    hls_url = trailer["hlsManifest"].replace('\\/', '/')
+                                    
+                                    # Get all possible direct video URLs
+                                    possible_urls = convert_hls_to_direct_url(hls_url)
+                                    
+                                    # Add the first converted URL (not the HLS manifest)
+                                    for url in possible_urls:
+                                        if not url.endswith('.m3u8'):
+                                            video_urls.append(url)
+                                            print(f"   Added converted HLS: {url[:100]}...")
+                                            break
+                                    else:
+                                        # If no direct URL, keep HLS as last resort
+                                        video_urls.append(hls_url)
+                                        print(f"   Added HLS manifest: {hls_url[:100]}...")
+                                        
+                                # Fallback to DASH manifest
+                                elif "dashManifests" in trailer and trailer["dashManifests"] and len(trailer["dashManifests"]) > 0:
+                                    url = trailer["dashManifests"][0].replace('\\/', '/')
+                                    video_urls.append(url)
+                                    print(f"   Added DASH: {url[:100]}...")
+                        
+                        if len(video_urls) > 0:
+                            print(f"   Total from data-props: {len(video_urls)} trailer(s)")
+                    
+            except json.JSONDecodeError as e:
+                print(f"   JSON decode error: {e}")
+            except Exception as e:
+                print(f"   data-props error: {e}")
+        
+        # Method 2: Regex search for embedded video URLs in page source
+        if len(video_urls) < 3:
+            try:
+                page_source = driver.page_source
+                
+                # Pattern for embedded game description videos (direct files!)
+                embedded_pattern = r'https?://shared\.fastly\.steamstatic\.com/store_item_assets/steam/apps/\d+/extras/[^"\'<>\s]+\.webm[^"\'<>\s]*'
+                embedded_matches = re.findall(embedded_pattern, page_source)
+                
+                for url in embedded_matches[:3]:
+                    if url not in video_urls:
                         video_urls.append(url)
-        except:
-            pass
+                        print(f"   Found via regex: {url[:100]}...")
+                        if len(video_urls) >= 3:
+                            break
+                
+                # Also search for direct trailer videos
+                video_patterns = [
+                    r'https?://video\.[^"\'<>\s]+/store_trailers/[^"\'<>\s]+/movie480_vp9\.webm',
+                    r'https?://video\.[^"\'<>\s]+/store_trailers/[^"\'<>\s]+/movie_max_vp9\.webm',
+                    r'https?://video\.[^"\'<>\s]+/store_trailers/[^"\'<>\s]+/movie480\.webm',
+                    r'https?://cdn\.[^"\'<>\s]+/steam/apps/\d+/movie480\.webm',
+                ]
+                
+                exclude_keywords = ['steamdeck', 'hardware']
+                
+                for pattern in video_patterns:
+                    matches = re.findall(pattern, page_source)
+                    for url in matches:
+                        if not any(kw in url.lower() for kw in exclude_keywords):
+                            if url not in video_urls:
+                                video_urls.append(url)
+                                print(f"   Found trailer: {url[:100]}...")
+                                if len(video_urls) >= 3:
+                                    break
+                    if len(video_urls) >= 3:
+                        break
+                
+            except Exception as e:
+                print(f"   Regex error: {e}")
+        
+        # Method 3: Construct URLs from app ID as last resort
+        if len(video_urls) == 0:
+            try:
+                current_url = driver.current_url
+                app_id_match = re.search(r'/app/(\d+)/', current_url)
+                
+                if app_id_match:
+                    app_id = app_id_match.group(1)
+                    
+                    constructed_urls = [
+                        f"https://cdn.akamai.steamstatic.com/steam/apps/{app_id}/movie480.webm",
+                        f"https://cdn.cloudflare.steamstatic.com/steam/apps/{app_id}/movie480.webm",
+                    ]
+                    
+                    video_urls.append(constructed_urls[0])
+                    print(f"   Added constructed: {constructed_urls[0]}")
+            except Exception as e:
+                print(f"   Construction error: {e}")
             
     except Exception as e:
-        print(f"   Error extracting videos: {e}")
+        print(f"   Fatal error: {e}")
     
-    return video_urls[:3]  # Limit to 3 videos
+    # Return unique URLs, limit to 3
+    unique_urls = []
+    for url in video_urls:
+        if url not in unique_urls:
+            unique_urls.append(url)
+    
+    return unique_urls[:3]
 
 def scrape_game_details(driver, game_url, game_title, download_media_files=True):
     details = {
@@ -406,4 +541,4 @@ if __name__ == "__main__":
     scrape_steam_games(max_games=50, num_workers=5, scrape_details=True, download_media_files=True)
     
     # Quick scrape
-    # scrape_steam_games(max_games=1000, num_workers=10, scrape_details=False, download_media_files=Fals
+    # scrape_steam_games(max_games=1000, num_workers=10, scrape_details=False, download_media_files=False)
