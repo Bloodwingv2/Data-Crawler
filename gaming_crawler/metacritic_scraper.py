@@ -84,7 +84,7 @@ def scrape_metacritic_games():
 
     # Save to CSV
     df = pd.DataFrame(game_data)
-    df.to_csv("metacritic_games.csv", index=False)
+    df.to_csv("scraped_data/metacritic_games.csv", index=False)
     print("Scraped 10 games and saved to metacritic_games.csv")
 
 if __name__ == "__main__":
