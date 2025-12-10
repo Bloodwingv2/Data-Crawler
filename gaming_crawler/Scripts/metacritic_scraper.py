@@ -1,265 +1,329 @@
-import pandas as pd
+"""
+Metacritic Game Scraper with Selenium
+Extracts all game entries from Metacritic game pages and outputs to CSV
+"""
+
 from selenium import webdriver
 from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from selenium.webdriver.chrome.options import Options
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+import csv
 import time
-import os
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
-from threading import Lock
+from typing import List, Dict
 import re
 
-# Thread-safe lock for shared data
-data_lock = Lock()
-all_game_data = []
 
-def create_driver():
-    """Create a Chrome driver instance with optimal settings."""
-    options = webdriver.ChromeOptions()
-    options.add_argument('--headless')
-    options.add_argument('--disable-blink-features=AutomationControlled')
-    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
-    options.add_argument('--no-sandbox')
-    options.add_argument('--disable-dev-shm-usage')
-    options.add_argument('--disable-gpu')
-    options.add_argument('--window-size=1920,1080')
-    options.add_experimental_option("excludeSwitches", ["enable-logging"])
-    
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=options)
-    return driver
-
-def scrape_game_element(game, driver):
-    """Extract data from a single game element, including media from the game's page."""
-    try:
-        # --- Basic data from list page ---
-        title = game.find_element(By.CSS_SELECTOR, "a.c-finderProductCard_container").get_attribute('aria-label')
+class MetacriticGameScraper:
+    def __init__(self, headless: bool = True):
+        """Initialize the scraper with Selenium WebDriver"""
+        self.base_url = "https://www.metacritic.com"
+        self.driver = self._setup_driver(headless)
         
+    def _setup_driver(self, headless: bool):
+        """Setup Chrome WebDriver with options"""
+        chrome_options = Options()
+        if headless:
+            chrome_options.add_argument('--headless')
+        chrome_options.add_argument('--no-sandbox')
+        chrome_options.add_argument('--disable-dev-shm-usage')
+        chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+        chrome_options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
+        
+        driver = webdriver.Chrome(options=chrome_options)
+        return driver
+    
+    def wait_for_page_load(self, timeout: int = 10):
+        """Wait for page to fully load"""
         try:
-            critic_score_element = game.find_element(By.CSS_SELECTOR, ".c-siteReviewScore_background-positive span")
-            critic_score = critic_score_element.text
-        except NoSuchElementException:
-            critic_score = "N/A"
-
-        try:
-            user_score_element = game.find_element(By.CSS_SELECTOR, ".c-siteReviewScore_background-user span")
-            user_score = user_score_element.text
-        except NoSuchElementException:
-            user_score = "N/A"
-
-        try:
-            platform = game.find_element(By.CSS_SELECTOR, ".c-finderProductCard_platform").text
-        except NoSuchElementException:
-            platform = "N/A"
-
-        try:
-            release_date = game.find_element(By.CSS_SELECTOR, ".c-finderProductCard_releaseDate span:nth-child(2)").text
-        except NoSuchElementException:
-            release_date = "N/A"
-
-        try:
-            game_url = game.find_element(By.CSS_SELECTOR, "a.c-finderProductCard_container").get_attribute("href")
-        except NoSuchElementException:
-            game_url = "N/A"
-
-        # --- Media scraping from game page ---
-        images = []
-        videos = []
-        
-        if game_url and game_url.startswith("https://www.metacritic.com/game/"):
-            original_window = driver.current_window_handle
-            
-            try:
-                driver.execute_script("window.open(arguments[0], '_blank');", game_url)
-                driver.switch_to.window(driver.window_handles[1])
-
-                WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "div.c-productionDetails_screenshots, div.c-videoPlayer")))
-
-                # Scrape images
-                try:
-                    screenshot_elements = driver.find_elements(By.CSS_SELECTOR, ".c-imageGallery_thumbnails picture > img, .c-imageGallery_image picture > img")
-                    for elem in screenshot_elements:
-                        if img_url := elem.get_attribute("src"):
-                            # Metacritic uses responsive images, get a high-quality version
-                            img_url = re.sub(r'\/fit-in\/\d+x\d+\/', '/fit-in/1920x1080/', img_url)
-                            images.append(img_url)
-                except NoSuchElementException:
-                    pass
-
-                # Scrape videos
-                try:
-                    video_player = driver.find_element(By.CSS_SELECTOR, "div[data-mcvideourl]")
-                    if video_url := video_player.get_attribute("data-mcvideourl"):
-                        videos.append(video_url)
-                except NoSuchElementException:
-                    pass
-
-            except TimeoutException:
-                print(f"[Media Scraper] Timeout loading media page for: {title}")
-            except Exception as e:
-                print(f"[Media Scraper] Error scraping media for {title}: {e}")
-            finally:
-                if len(driver.window_handles) > 1:
-                    driver.close()
-                    driver.switch_to.window(original_window)
-        
-        return {
-            "title": title,
-            "critic_score": critic_score,
-            "user_score": user_score,
-            "platform": platform,
-            "release_date": release_date,
-            "url": game_url,
-            "images": ", ".join(list(set(images))) if images else "N/A",
-            "videos": ", ".join(list(set(videos))) if videos else "N/A",
-        }
-
-    except Exception as e:
-        print(f"Error scraping game element: {e}")
-        return None
-
-def scrape_page_range(worker_id, start_page, end_page):
-    """Scrape a range of Metacritic pages."""
-    driver = create_driver()
-    local_data = []
-    
-    try:
-        total_pages = end_page - start_page + 1
-        print(f"[Worker {worker_id}] Starting - Pages {start_page} to {end_page} ({total_pages} pages)")
-        
-        for page_num in range(start_page, end_page + 1):
-            try:
-                # Metacritic uses a 'page' query parameter
-                url = f"https://www.metacritic.com/browse/game/?page={page_num}"
-                driver.get(url)
-
-                # Handle cookie consent if it appears
-                try:
-                    cookie_button = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.ID, "onetrust-accept-btn-handler")))
-                    cookie_button.click()
-                except TimeoutException:
-                    pass # Cookie button not found, continue
-
-                wait = WebDriverWait(driver, 15)
-                games = wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, ".c-finderProductCard")))
-                
-                page_games = 0
-                for game in games:
-                    game_data = scrape_game_element(game, driver)
-                    if game_data:
-                        local_data.append(game_data)
-                        page_games += 1
-                
-                print(f"[Worker {worker_id}] Page {page_num}: Scraped {page_games} games (Total for worker: {len(local_data)})")
-                
-                if not games:
-                    print(f"[Worker {worker_id}] No games found on page {page_num}. Ending worker.")
-                    break
-                
-                time.sleep(2) # Be respectful to Metacritic's servers
-                
-            except Exception as e:
-                print(f"[Worker {worker_id}] Error on page {page_num}: {e}")
-                continue
-        
-        print(f"[Worker {worker_id}] ✓ Completed - Total scraped by worker: {len(local_data)} games")
-        
-    except Exception as e:
-        print(f"[Worker {worker_id}] ✗ Fatal error: {e}")
-    finally:
-        driver.quit()
-    
-    with data_lock:
-        all_game_data.extend(local_data)
-    
-    return local_data
-
-async def scrape_metacritic_async(total_games=100, num_workers=4):
-    """Scrape Metacritic games asynchronously, including media."""
-    global all_game_data
-    all_game_data = []
-    
-    print(f"🚀 Starting async Metacritic scraper with {num_workers} workers")
-    print(f"📊 Target: {total_games} games")
-    
-    start_time = time.time()
-    
-    # Metacritic shows 20 games per page
-    games_per_page = 20
-    total_pages_needed = (total_games + games_per_page - 1) // games_per_page
-    pages_per_worker = max(1, total_pages_needed // num_workers)
-    
-    print(f"📄 Estimated pages needed: {total_pages_needed}")
-    print(f"📋 Pages per worker: {pages_per_worker}\n")
-    
-    loop = asyncio.get_event_loop()
-    
-    with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        tasks = []
-        page_chunks = [range(i, min(i + pages_per_worker, total_pages_needed + 1)) 
-                       for i in range(1, total_pages_needed + 1, pages_per_worker)]
-
-        for i, page_range in enumerate(page_chunks):
-            if not page_range: continue
-            start_page = page_range.start
-            end_page = page_range.stop - 1
-
-            task = loop.run_in_executor(
-                executor,
-                scrape_page_range,
-                i + 1,
-                start_page,
-                end_page
+            WebDriverWait(self.driver, timeout).until(
+                lambda d: d.execute_script('return document.readyState') == 'complete'
             )
-            tasks.append(task)
-        
-        await asyncio.gather(*tasks)
+            time.sleep(2)  # Additional wait for dynamic content
+        except TimeoutException:
+            print("Page load timeout")
     
-    end_time = time.time()
-    elapsed_time = end_time - start_time
+    def extract_game_from_element(self, element, section: str = '') -> Dict:
+        """Extract game information from a web element"""
+        game_data = {'section': section}
+        
+        try:
+            # Extract title
+            try:
+                title_elem = element.find_element(By.CSS_SELECTOR, 'a[href*="/game/"]')
+                game_data['title'] = title_elem.text.strip()
+                game_data['url'] = title_elem.get_attribute('href')
+            except NoSuchElementException:
+                return None
+            
+            # Extract score
+            try:
+                # Look for score in various possible locations
+                score_text = element.text
+                score_match = re.search(r'\b(\d{1,3})\b', score_text)
+                if score_match:
+                    score = int(score_match.group(1))
+                    if 0 <= score <= 100:  # Valid Metacritic score range
+                        game_data['score'] = score
+                else:
+                    game_data['score'] = 'TBD'
+            except:
+                game_data['score'] = 'TBD'
+            
+            # Extract rating category
+            rating_keywords = [
+                'Universal Acclaim', 'Generally Favorable', 
+                'Mixed or Average', 'Generally Unfavorable', 
+                'Overwhelming Dislike'
+            ]
+            for rating in rating_keywords:
+                if rating.lower() in element.text.lower():
+                    game_data['rating'] = rating
+                    break
+            
+            if 'rating' not in game_data:
+                game_data['rating'] = 'N/A'
+            
+            # Extract image URL
+            try:
+                img_elem = element.find_element(By.TAG_NAME, 'img')
+                game_data['image_url'] = img_elem.get_attribute('src')
+            except NoSuchElementException:
+                game_data['image_url'] = ''
+            
+            # Extract platform if available
+            try:
+                platform_elem = element.find_element(By.CSS_SELECTOR, '[class*="platform"]')
+                game_data['platform'] = platform_elem.text.strip()
+            except NoSuchElementException:
+                game_data['platform'] = 'Multiple/Unknown'
+            
+            return game_data if game_data.get('title') else None
+            
+        except Exception as e:
+            print(f"Error extracting game data: {e}")
+            return None
     
-    if all_game_data:
-        df = pd.DataFrame(all_game_data)
-        initial_count = len(df)
-        df = df.drop_duplicates(subset=['url'], keep='first').reset_index(drop=True)
-        duplicates_removed = initial_count - len(df)
+    def scrape_main_page(self) -> List[Dict]:
+        """Scrape the main /game/ page"""
+        print("Navigating to Metacritic game page...")
+        self.driver.get(f"{self.base_url}/game/")
+        self.wait_for_page_load()
         
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        scraped_data_dir = os.path.join(script_dir, "scraped_data")
-        os.makedirs(scraped_data_dir, exist_ok=True)
+        all_games = []
         
-        output_file = os.path.join(scraped_data_dir, "metacritic_games_media.csv")
-        df.to_csv(output_file, index=False, encoding='utf-8-sig')
+        # Define sections to scrape
+        sections = {
+            'New Releases': 'new_releases',
+            'Upcoming Games': 'upcoming_games',
+            'Best Games': 'best_games',
+            'New on PlayStation Plus': 'playstation_plus',
+            'New on Xbox Game Pass': 'xbox_game_pass'
+        }
         
-        print(f"\n{'='*60}")
-        print(f"✅ METACRITIC SCRAPING COMPLETE!")
-        print(f"{'='*60}")
-        print(f"📦 Total games processed: {initial_count}")
-        print(f"🔄 Duplicates removed: {duplicates_removed}")
-        print(f"🎯 Unique games saved: {len(df)}")
-        print(f"⏱️  Time taken: {elapsed_time:.2f} seconds")
-        if elapsed_time > 0:
-            print(f"⚡ Speed: {len(df) / elapsed_time:.2f} games/second")
-        print(f"💾 Saved to: {output_file}")
-        print(f"{'='*60}\n")
+        # Scroll to load more content
+        self.scroll_page()
         
-        print("Sample of scraped data:")
-        print(df[['title', 'critic_score', 'user_score', 'images', 'videos']].head(10).to_string(index=False))
+        # Find all game links
+        try:
+            game_links = self.driver.find_elements(By.CSS_SELECTOR, 'a[href*="/game/"]')
+            print(f"Found {len(game_links)} game links")
+            
+            # Get current section context
+            current_section = 'general'
+            processed_urls = set()
+            
+            for link in game_links:
+                try:
+                    url = link.get_attribute('href')
+                    
+                    # Skip if already processed
+                    if url in processed_urls:
+                        continue
+                    
+                    # Get parent container for full context
+                    parent = link.find_element(By.XPATH, './ancestor::*[position()<=3]')
+                    
+                    # Determine section from nearby headers
+                    try:
+                        page_text = self.driver.find_element(By.TAG_NAME, 'body').text
+                        link_position = page_text.find(link.text)
+                        
+                        for section_name, section_key in sections.items():
+                            section_position = page_text.find(section_name)
+                            if section_position != -1 and section_position < link_position:
+                                current_section = section_key
+                    except:
+                        pass
+                    
+                    game_data = self.extract_game_from_element(parent, current_section)
+                    
+                    if game_data:
+                        all_games.append(game_data)
+                        processed_urls.add(url)
+                        
+                except Exception as e:
+                    continue
+            
+        except Exception as e:
+            print(f"Error finding game links: {e}")
         
-    else:
-        print("❌ No games were scraped.")
+        return all_games
     
-    return all_game_data
+    def scrape_browse_page(self, platform: str = 'all', 
+                          sort: str = 'metascore',
+                          limit: int = 100) -> List[Dict]:
+        """Scrape the browse page for a specific platform"""
+        url = f"{self.base_url}/browse/game/{platform}/all/all-time/{sort}/"
+        print(f"Navigating to browse page: {url}")
+        
+        self.driver.get(url)
+        self.wait_for_page_load()
+        
+        games = []
+        
+        # Scroll to load more games
+        for _ in range(5):  # Scroll multiple times to load more content
+            self.scroll_page()
+            time.sleep(1)
+        
+        # Find game elements
+        try:
+            game_elements = self.driver.find_elements(By.CSS_SELECTOR, 'a[href*="/game/"]')
+            print(f"Found {len(game_elements)} game elements")
+            
+            processed_urls = set()
+            
+            for elem in game_elements[:limit]:
+                try:
+                    url = elem.get_attribute('href')
+                    
+                    if url in processed_urls:
+                        continue
+                    
+                    parent = elem.find_element(By.XPATH, './ancestor::*[position()<=3]')
+                    game_data = self.extract_game_from_element(parent, f'browse_{platform}')
+                    
+                    if game_data:
+                        games.append(game_data)
+                        processed_urls.add(url)
+                        
+                except Exception as e:
+                    continue
+            
+        except Exception as e:
+            print(f"Error scraping browse page: {e}")
+        
+        return games
+    
+    def scroll_page(self):
+        """Scroll page to load dynamic content"""
+        try:
+            # Scroll down in increments
+            scroll_height = self.driver.execute_script("return document.body.scrollHeight")
+            current_position = 0
+            scroll_increment = 500
+            
+            while current_position < scroll_height:
+                current_position += scroll_increment
+                self.driver.execute_script(f"window.scrollTo(0, {current_position});")
+                time.sleep(0.3)
+            
+            # Scroll back to top
+            self.driver.execute_script("window.scrollTo(0, 0);")
+            time.sleep(0.5)
+            
+        except Exception as e:
+            print(f"Error scrolling: {e}")
+    
+    def save_to_csv(self, games: List[Dict], filename: str = 'metacritic_games.csv'):
+        """Save games to CSV file"""
+        if not games:
+            print("No games to save!")
+            return
+        
+        # Get all unique keys
+        all_keys = set()
+        for game in games:
+            all_keys.update(game.keys())
+        
+        fieldnames = sorted(all_keys)
+        
+        with open(filename, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(games)
+        
+        print(f"\n✓ Successfully saved {len(games)} games to {filename}")
+    
+    def close(self):
+        """Close the browser"""
+        if self.driver:
+            self.driver.quit()
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
 
-def scrape_metacritic_games(max_games=100, num_workers=4):
-    """Synchronous wrapper for the async media scraper."""
-    return asyncio.run(scrape_metacritic_async(max_games, num_workers))
+
+def main():
+    """Main execution"""
+    print("=" * 60)
+    print("Metacritic Game Scraper with Selenium")
+    print("=" * 60)
+    
+    # Use context manager to ensure driver closes
+    with MetacriticGameScraper(headless=True) as scraper:
+        
+        # Scrape main page
+        print("\n[1/3] Scraping main game page...")
+        main_page_games = scraper.scrape_main_page()
+        print(f"Found {len(main_page_games)} games from main page")
+        
+        # Scrape PS5 browse page
+        print("\n[2/3] Scraping PS5 browse page...")
+        ps5_games = scraper.scrape_browse_page(platform='ps5', limit=50)
+        print(f"Found {len(ps5_games)} PS5 games")
+        
+        # Scrape PC browse page
+        print("\n[3/3] Scraping PC browse page...")
+        pc_games = scraper.scrape_browse_page(platform='pc', limit=50)
+        print(f"Found {len(pc_games)} PC games")
+        
+        # Combine all games and remove duplicates
+        all_games = main_page_games + ps5_games + pc_games
+        
+        # Remove duplicates based on URL
+        unique_games = []
+        seen_urls = set()
+        for game in all_games:
+            url = game.get('url', '')
+            if url and url not in seen_urls:
+                unique_games.append(game)
+                seen_urls.add(url)
+        
+        print(f"\n" + "=" * 60)
+        print(f"Total unique games collected: {len(unique_games)}")
+        print("=" * 60)
+        
+        # Save to CSV
+        scraper.save_to_csv(unique_games, 'metacritic_games.csv')
+        
+        # Display sample
+        print("\nSample of collected games:")
+        print("-" * 60)
+        for i, game in enumerate(unique_games[:10], 1):
+            print(f"{i}. {game.get('title', 'N/A')}")
+            print(f"   Score: {game.get('score', 'N/A')} | Rating: {game.get('rating', 'N/A')}")
+            print(f"   Section: {game.get('section', 'N/A')}")
+            print()
+
 
 if __name__ == "__main__":
-    # Scrape 40 games using 4 workers as an example.
-    # NOTE: Scraping with media is significantly slower per game.
-    scrape_metacritic_games(max_games=500, num_workers=4)
+    main()
+    
+# scrape data to scraped_data folder inside which there is meta_critic data folder
+# Scrape Images as well 
