@@ -1,3 +1,4 @@
+
 import pandas as pd
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -10,11 +11,21 @@ from selenium.webdriver.chrome.options import Options
 import time
 
 def scrape_epic_games():
-    # Setup Chrome driver
-    options = Options()
-    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
-    service = Service(ChromeDriverManager().install())
+    options = webdriver.ChromeOptions()
+    options.add_argument('--headless')
+    options.add_argument('--disable-blink-features=AutomationControlled')
+    options.add_argument('--no-sandbox')
+    options.add_argument('--disable-dev-shm-usage')
+    options.add_argument('--disable-gpu')
+    options.add_argument('--window-size=1920,1080')
+    options.add_experimental_option("excludeSwitches", ["enable-logging"])
+    service = Service(ChromeDriverManager().install())    
     driver = webdriver.Chrome(service=service, options=options)
+    # # Setup Chrome driver
+    # options = Options()
+    # options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+    # service = Service(ChromeDriverManager().install())
+    # driver = webdriver.Chrome(service=service, options=options)
 
     # Open Epic Games store page
     driver.get("https://store.epicgames.com/en-US/browse")
