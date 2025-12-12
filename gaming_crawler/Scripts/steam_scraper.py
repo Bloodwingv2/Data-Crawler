@@ -256,6 +256,12 @@ def extract_video_urls(driver):
     
     return unique_urls[:3]
 
+def has_media_content(screenshots, videos):
+    """Check if game has valid screenshots or videos."""
+    has_screenshots = screenshots != "N/A" and screenshots.strip() != ""
+    has_videos = videos != "N/A" and videos.strip() != ""
+    return has_screenshots or has_videos
+
 def scrape_game_details(driver, game_url, game_title, download_media_files=True):
     details = {
         "genres": "N/A", "categories": "N/A", "multiplayer": "No", "singleplayer": "No",
@@ -453,6 +459,12 @@ def scrape_page_range(worker_id, start_page, end_page, scrape_details=True, down
                             print(f"[Worker {worker_id}] Scraping: {game_data['title']}")
                             details = scrape_game_details(driver, game_data["url"], game_data["title"], download_media_files)
                             game_data.update(details)
+                            
+                            # Filter: Only keep games with screenshots or videos
+                            if not has_media_content(game_data.get("screenshots", "N/A"), game_data.get("videos", "N/A")):
+                                print(f"[Worker {worker_id}] ⚠️  Skipping {game_data['title']} - No media content")
+                                continue
+                        
                         local_data.append(game_data)
                 
                 print(f"[Worker {worker_id}] Page {page_num}: {len(games)} games (Total: {len(local_data)})")
@@ -480,7 +492,8 @@ def scrape_steam_games(max_games=100, num_workers=5, scrape_details=True, downlo
     all_game_data = []
     
     print(f"🚀 Starting with {num_workers} workers | Target: {max_games} games")
-    print(f"🔍 Details: {'ON' if scrape_details else 'OFF'} | Media: {'ON' if download_media_files else 'OFF'}\n")
+    print(f"🔍 Details: {'ON' if scrape_details else 'OFF'} | Media: {'ON' if download_media_files else 'OFF'}")
+    print(f"🎬 Filter: Games WITHOUT screenshots/videos will be DROPPED\n")
     
     start_time = time.time()
     
@@ -514,6 +527,12 @@ def scrape_steam_games(max_games=100, num_workers=5, scrape_details=True, downlo
         initial_count = len(df)
         df = df.drop_duplicates(subset=['url'], keep='first')
         
+        # Additional filter at DataFrame level (safety check)
+        before_filter = len(df)
+        df = df[df.apply(lambda row: has_media_content(row.get("screenshots", "N/A"), row.get("videos", "N/A")), axis=1)]
+        after_filter = len(df)
+        dropped_count = before_filter - after_filter
+        
         script_dir = os.path.dirname(os.path.abspath(__file__))
         output_file = os.path.join(script_dir, "scraped_data", "steam_games_detailed.csv")
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
@@ -521,6 +540,8 @@ def scrape_steam_games(max_games=100, num_workers=5, scrape_details=True, downlo
         
         print(f"\n{'='*60}")
         print(f"✅ COMPLETE | {len(df)} games | {elapsed:.1f}s | {len(df)/elapsed:.2f} games/s")
+        if dropped_count > 0:
+            print(f"🗑️  Dropped {dropped_count} games with no media content")
         print(f"💾 Saved: {output_file}")
         print(f"{'='*60}\n")
         
@@ -532,6 +553,8 @@ def scrape_steam_games(max_games=100, num_workers=5, scrape_details=True, downlo
             print(f"   Multi-player: {len(df[df['multiplayer'] == 'Yes'])}")
             print(f"   Free: {len(df[df['price'] == 'Free'])}")
             print(f"   On sale: {len(df[df['discount_percentage'] != 'N/A'])}")
+            print(f"   With screenshots: {len(df[df['screenshots'] != 'N/A'])}")
+            print(f"   With videos: {len(df[df['videos'] != 'N/A'])}")
     else:
         print("❌ No games scraped")
     
@@ -545,4 +568,4 @@ if __name__ == "__main__":
     print(f"Total execution time: {end - start:.4f} seconds")
     # Increase number of workers above for faster scraping on powerful machines
     # Quick scrape
-    # scrape_steam_games(max_games=1000, num_workers=10, scrape_details=False, download_media_files=False)W
+    # scrape_steam_games(max_games=1000, num_workers=10, scrape_details=False, download_media_files=False)

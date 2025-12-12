@@ -4,6 +4,7 @@ gog_scraper.py
 
 Single-file Selenium-based GOG scraper that downloads header image, screenshots and direct mp4 trailers,
 and writes a detailed CSV. Configure via command-line args or constants below.
+ENHANCED: Filters out games with no screenshots and no videos
 
 Requirements:
   pip install selenium webdriver-manager pandas requests
@@ -64,6 +65,12 @@ def safe_getattr(elem, attr):
 
 def rand_sleep(a=DEFAULT_PAGE_SLEEP[0], b=DEFAULT_PAGE_SLEEP[1]):
     time.sleep(random.uniform(a, b))
+
+def has_media_content(screenshots, videos):
+    """Check if game has valid screenshots or videos."""
+    has_screenshots = screenshots != "N/A" and screenshots.strip() != ""
+    has_videos = videos != "N/A" and videos.strip() != ""
+    return has_screenshots or has_videos
 
 # -----------------------
 # Downloader with retries
@@ -513,6 +520,11 @@ def scrape_pages(worker_id: int, start_page: int, end_page: int, headless=True, 
                         details = extract_details_from_page(driver, g["url"], g.get("title", "N/A"), download_media_flag=download_media)
                         # merge
                         merged = {**g, **details}
+                        
+                        # Filter: Only keep games with screenshots or videos
+                        if not has_media_content(merged.get("screenshots", "N/A"), merged.get("videos", "N/A")):
+                            print(f"[W{worker_id}] ⚠️  Skipping {merged.get('title', 'Unknown')} - No media content")
+                            continue
                     else:
                         merged = g
                     local_results.append(merged)
@@ -543,7 +555,12 @@ def scrape_gog_games(max_games=DEFAULT_MAX_GAMES, num_workers=DEFAULT_WORKERS, h
     total_pages = max(1, (max_games + GAMES_PER_PAGE - 1) // GAMES_PER_PAGE)
     pages_per_worker = max(1, (total_pages + num_workers - 1) // num_workers)
 
-    print(f"Starting GOG scrape: max_games={max_games}, pages={total_pages}, workers={num_workers}")
+    print(f"🚀 Starting GOG scrape: max_games={max_games}, pages={total_pages}, workers={num_workers}")
+    print(f"🔍 Details: {'ON' if scrape_details else 'OFF'} | Media: {'ON' if download_media else 'OFF'}")
+    print(f"🎬 Filter: Games WITHOUT screenshots/videos will be DROPPED\n")
+    
+    start_time = time.time()
+    
     with ThreadPoolExecutor(max_workers=num_workers) as exe:
         futures = []
         for i in range(num_workers):
@@ -559,18 +576,36 @@ def scrape_gog_games(max_games=DEFAULT_MAX_GAMES, num_workers=DEFAULT_WORKERS, h
             except Exception as e:
                 print("Worker error:", e)
 
+    elapsed = time.time() - start_time
+
     # postprocess global results and write CSV
     if not all_game_data:
-        print("No games scraped.")
+        print("❌ No games scraped.")
         return []
 
     df = pd.DataFrame(all_game_data)
+    
     # dedupe by URL if present
     if 'url' in df.columns:
+        initial_count = len(df)
         df = df.drop_duplicates(subset=['url'], keep='first')
+        duplicates_removed = initial_count - len(df)
+    else:
+        duplicates_removed = 0
+    
+    # Additional filter at DataFrame level (safety check)
+    before_filter = len(df)
+    df = df[df.apply(lambda row: has_media_content(
+        row.get("screenshots", "N/A"), 
+        row.get("videos", "N/A")
+    ), axis=1)]
+    after_filter = len(df)
+    dropped_count = before_filter - after_filter
+    
     out_dir = Path("scraped_data")
     out_dir.mkdir(parents=True, exist_ok=True)
     out_file = out_dir / "gog_games_detailed.csv"
+    
     # ensure some expected columns exist
     req_cols = [
         'title', 'release_date', 'original_price', 'price', 'discount_percentage',
@@ -584,7 +619,61 @@ def scrape_gog_games(max_games=DEFAULT_MAX_GAMES, num_workers=DEFAULT_WORKERS, h
             df[c] = "N/A"
     df = df[req_cols]
     df.to_csv(out_file, index=False, encoding='utf-8-sig')
-    print(f"Saved CSV: {out_file} (games={len(df)})")
+    
+    # Print summary
+    print(f"\n{'='*70}")
+    print(f"✅ SCRAPING COMPLETE")
+    print(f"   Total games: {len(df)}")
+    print(f"   Duplicates removed: {duplicates_removed}")
+    if dropped_count > 0:
+        print(f"   🗑️  Dropped {dropped_count} games with no media content")
+    print(f"   Time: {elapsed:.1f}s")
+    print(f"   Speed: {len(df)/elapsed:.2f} games/sec")
+    print(f"💾 Saved CSV: {out_file}")
+    print(f"{'='*70}\n")
+    
+    # Print statistics
+    if scrape_details:
+        print(f"📊 Statistics:")
+        
+        if 'developer' in df.columns:
+            dev_counts = df[df['developer'] != 'N/A']['developer'].value_counts()
+            if not dev_counts.empty:
+                print(f"   Top developer: {dev_counts.index[0]} ({dev_counts.iloc[0]} games)")
+        
+        if 'genres' in df.columns:
+            non_na_genres = df[df['genres'] != 'N/A']
+            print(f"   Games with genre info: {len(non_na_genres)}")
+        
+        if 'platforms' in df.columns:
+            non_na_platforms = df[df['platforms'] != 'N/A']
+            print(f"   Games with platform info: {len(non_na_platforms)}")
+        
+        if 'singleplayer' in df.columns:
+            sp_games = df[df['singleplayer'] == 'Yes']
+            print(f"   Single-player games: {len(sp_games)}")
+        
+        if 'multiplayer' in df.columns:
+            mp_games = df[df['multiplayer'] == 'Yes']
+            print(f"   Multi-player games: {len(mp_games)}")
+        
+        if download_media:
+            if 'screenshots' in df.columns:
+                games_with_screenshots = df[df['screenshots'] != 'N/A']
+                print(f"   Games with screenshots: {len(games_with_screenshots)}")
+            
+            if 'videos' in df.columns:
+                games_with_videos = df[df['videos'] != 'N/A']
+                print(f"   Games with videos: {len(games_with_videos)}")
+            
+            if 'downloaded_images' in df.columns:
+                total_images = sum(len(eval(str(x))) if isinstance(x, (str, list)) and str(x).startswith('[') else 0 for x in df['downloaded_images'])
+                print(f"   Images downloaded: {total_images}")
+            
+            if 'downloaded_videos' in df.columns:
+                total_videos = sum(len(eval(str(x))) if isinstance(x, (str, list)) and str(x).startswith('[') else 0 for x in df['downloaded_videos'])
+                print(f"   🎬 Videos downloaded: {total_videos}")
+    
     return df.to_dict(orient='records')
 
 # -----------------------
@@ -602,13 +691,7 @@ if __name__ == "__main__":
     parser.add_argument("--debug", action="store_true", help="Run in non-headless mode and verbose")
     args = parser.parse_args()
 
-    headless = args.headless and not args.debug
-    download_media = not args.no_media
-    scrape_details = not args.no_details
-
-    if args.debug:
-        print("DEBUG: headless disabled for easier troubleshooting")
-        headless = False
+    headless = False
 
     start = time.perf_counter()
     scrape_gog_games(max_games=50, num_workers=15, headless=True, scrape_details=True, download_media=True)

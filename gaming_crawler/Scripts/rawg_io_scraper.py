@@ -2,6 +2,7 @@
 RAWG.io Game Database Advanced Web Scraper
 Multi-threaded scraping with media downloads (Images + Videos)
 Uses Selenium in headless mode (no GUI)
+ENHANCED: Filters out games with no screenshots and no videos
 """
 
 import pandas as pd
@@ -60,6 +61,13 @@ def scroll_page_incrementally(driver, scroll_times=3, pause=2):
     for i in range(scroll_times):
         driver.execute_script("window.scrollBy(0, window.innerHeight);")
         time.sleep(pause)
+
+def has_media_content(screenshots, video_urls, video_embeds):
+    """Check if game has valid screenshots or videos."""
+    has_screenshots = screenshots != "N/A" and screenshots.strip() != ""
+    has_videos = (video_urls != "N/A" and video_urls.strip() != "") or \
+                 (video_embeds != "N/A" and video_embeds.strip() != "")
+    return has_screenshots or has_videos
 
 def scrape_game_element(game_element, base_url):
     """Extract basic game data from a game card element"""
@@ -471,6 +479,15 @@ def scrape_page_range(worker_id, start_page, end_page, base_url, scrape_details=
                                 print(f"[Worker {worker_id}] Scraping: {game_data['title']}")
                                 details = scrape_game_details(driver, game_data["url"], game_data["title"], download_media_files)
                                 game_data.update(details)
+                                
+                                # Filter: Only keep games with screenshots or videos
+                                if not has_media_content(
+                                    game_data.get("screenshots", "N/A"), 
+                                    game_data.get("video_urls", "N/A"),
+                                    game_data.get("video_embeds", "N/A")
+                                ):
+                                    print(f"[Worker {worker_id}] ⚠️  Skipping {game_data['title']} - No media content")
+                                    continue
                             
                             local_data.append(game_data)
                     except StaleElementReferenceException:
@@ -514,7 +531,8 @@ def scrape_rawg_games(max_games=100, num_workers=5, scrape_details=True, downloa
     
     print(f"🚀 RAWG.io Scraper Starting (WITH VIDEO SUPPORT)")
     print(f"   Workers: {num_workers} | Target: {max_games} games")
-    print(f"   Details: {'ON' if scrape_details else 'OFF'} | Media (Images+Videos): {'ON' if download_media_files else 'OFF'}\n")
+    print(f"   Details: {'ON' if scrape_details else 'OFF'} | Media (Images+Videos): {'ON' if download_media_files else 'OFF'}")
+    print(f"   🎬 Filter: Games WITHOUT screenshots/videos will be DROPPED\n")
     
     start_time = time.time()
     
@@ -566,6 +584,16 @@ def scrape_rawg_games(max_games=100, num_workers=5, scrape_details=True, downloa
         df = df.drop_duplicates(subset=['url'], keep='first')
         duplicates_removed = initial_count - len(df)
         
+        # Additional filter at DataFrame level (safety check)
+        before_filter = len(df)
+        df = df[df.apply(lambda row: has_media_content(
+            row.get("screenshots", "N/A"), 
+            row.get("video_urls", "N/A"),
+            row.get("video_embeds", "N/A")
+        ), axis=1)]
+        after_filter = len(df)
+        dropped_count = before_filter - after_filter
+        
         # Save to file
         script_dir = os.path.dirname(os.path.abspath(__file__))
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -578,6 +606,8 @@ def scrape_rawg_games(max_games=100, num_workers=5, scrape_details=True, downloa
         print(f"✅ SCRAPING COMPLETE")
         print(f"   Total games: {len(df)}")
         print(f"   Duplicates removed: {duplicates_removed}")
+        if dropped_count > 0:
+            print(f"   🗑️  Dropped {dropped_count} games with no media content")
         print(f"   Time: {elapsed:.1f}s")
         print(f"   Speed: {len(df)/elapsed:.2f} games/sec")
         print(f"💾 Saved: {output_file}")
@@ -623,9 +653,17 @@ def scrape_rawg_games(max_games=100, num_workers=5, scrape_details=True, downloa
                     games_with_videos = df[df['video_urls'] != 'N/A']
                     print(f"   Games with video URLs: {len(games_with_videos)}")
                 
+                if 'video_embeds' in df.columns:
+                    games_with_embeds = df[df['video_embeds'] != 'N/A']
+                    print(f"   Games with video embeds: {len(games_with_embeds)}")
+                
                 if 'trailer_url' in df.columns:
                     games_with_trailers = df[df['trailer_url'] != 'N/A']
                     print(f"   Games with trailers: {len(games_with_trailers)}")
+                
+                if 'screenshots' in df.columns:
+                    games_with_screenshots = df[df['screenshots'] != 'N/A']
+                    print(f"   Games with screenshots: {len(games_with_screenshots)}")
     else:
         print("❌ No games scraped!")
     
