@@ -638,6 +638,8 @@ if __name__ == "__main__":
     # scrape_rawg_games(max_games=100, num_workers=5, scrape_details=False, download_media_files=False)
     
     # Option 2: Detailed scrape with media INCLUDING VIDEOS (slower)
+    
+    start = time.perf_counter()
     scrape_rawg_games(
         max_games=500, 
         num_workers=15, 
@@ -645,6 +647,8 @@ if __name__ == "__main__":
         download_media_files=True,
         base_url="https://rawg.io/"
     )
+    end = time.perf_counter()
+    print(f"Total execution time: {end - start:.4f} seconds")
     
     # Option 3: High-volume scrape (for powerful machines)
     # scrape_rawg_games(max_games=1000, num_workers=10, scrape_details=True, download_media_files=True)

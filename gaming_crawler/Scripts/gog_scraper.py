@@ -610,4 +610,7 @@ if __name__ == "__main__":
         print("DEBUG: headless disabled for easier troubleshooting")
         headless = False
 
-    scrape_gog_games(max_games=10, num_workers=15, headless=True, scrape_details=True, download_media=True)
+    start = time.perf_counter()
+    scrape_gog_games(max_games=50, num_workers=15, headless=True, scrape_details=True, download_media=True)
+    end = time.perf_counter()
+    print(f"Total execution time: {end - start:.4f} seconds")
