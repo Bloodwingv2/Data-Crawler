@@ -1,6 +1,6 @@
 """
 RAWG.io Game Database Advanced Web Scraper
-Multi-threaded scraping with media downloads
+Multi-threaded scraping with media downloads (Images + Videos)
 Uses Selenium in headless mode (no GUI)
 """
 
@@ -40,9 +40,9 @@ def create_driver():
     return webdriver.Chrome(service=service, options=options)
 
 def download_media(url, save_dir, filename):
-    """Download images and media files"""
+    """Download images and video files"""
     try:
-        response = requests.get(url, timeout=15, stream=True, headers={
+        response = requests.get(url, timeout=30, stream=True, headers={
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         })
         if response.status_code == 200:
@@ -135,6 +135,149 @@ def scrape_game_element(game_element, base_url):
     
     return game_data if game_data["title"] != "N/A" else None
 
+def scrape_videos(driver, game_media_dir, game_title):
+    """
+    Scrape video content from the game page
+    Returns dict with video URLs and downloaded video paths
+    """
+    video_data = {
+        "video_urls": [],
+        "video_embeds": [],
+        "downloaded_videos": [],
+        "trailer_url": "N/A"
+    }
+    
+    try:
+        # Method 1: Look for HTML5 video tags
+        try:
+            video_elems = driver.find_elements(By.TAG_NAME, "video")
+            for idx, video in enumerate(video_elems[:3]):  # Limit to 3 videos
+                try:
+                    # Try to get the video source
+                    video_src = video.get_attribute('src')
+                    if not video_src:
+                        # Check for source tags inside video
+                        sources = video.find_elements(By.TAG_NAME, "source")
+                        if sources:
+                            video_src = sources[0].get_attribute('src')
+                    
+                    if video_src and video_src.startswith('http'):
+                        video_data["video_urls"].append(video_src)
+                        print(f"   Found video: {video_src[:50]}...")
+                        
+                        # Download the video
+                        video_ext = 'mp4'  # Default extension
+                        if '.webm' in video_src.lower():
+                            video_ext = 'webm'
+                        elif '.mov' in video_src.lower():
+                            video_ext = 'mov'
+                        
+                        downloaded = download_media(
+                            video_src, 
+                            game_media_dir, 
+                            f"video_{idx+1}.{video_ext}"
+                        )
+                        if downloaded:
+                            video_data["downloaded_videos"].append(downloaded)
+                except Exception as e:
+                    print(f"   Error processing video element: {e}")
+                    continue
+        except:
+            pass
+        
+        # Method 2: Look for YouTube embeds
+        try:
+            iframe_elems = driver.find_elements(By.TAG_NAME, "iframe")
+            for iframe in iframe_elems:
+                try:
+                    src = iframe.get_attribute('src')
+                    if src and ('youtube.com' in src or 'youtu.be' in src):
+                        video_data["video_embeds"].append(src)
+                        if video_data["trailer_url"] == "N/A":
+                            video_data["trailer_url"] = src
+                        print(f"   Found YouTube embed: {src[:50]}...")
+                except:
+                    continue
+        except:
+            pass
+        
+        # Method 3: Look for data attributes containing video URLs
+        try:
+            # Check for data-video, data-src, or similar attributes
+            elems_with_data = driver.find_elements(By.XPATH, "//*[@data-video or @data-src or @data-url]")
+            for elem in elems_with_data:
+                try:
+                    for attr in ['data-video', 'data-src', 'data-url', 'data-mp4']:
+                        video_url = elem.get_attribute(attr)
+                        if video_url and video_url.startswith('http') and any(ext in video_url.lower() for ext in ['.mp4', '.webm', '.mov', 'video']):
+                            if video_url not in video_data["video_urls"]:
+                                video_data["video_urls"].append(video_url)
+                                print(f"   Found video URL in data attribute: {video_url[:50]}...")
+                except:
+                    continue
+        except:
+            pass
+        
+        # Method 4: Execute JavaScript to find video sources
+        try:
+            js_videos = driver.execute_script("""
+                const videos = [];
+                document.querySelectorAll('video').forEach(v => {
+                    if (v.src) videos.push(v.src);
+                    v.querySelectorAll('source').forEach(s => {
+                        if (s.src) videos.push(s.src);
+                    });
+                });
+                return videos;
+            """)
+            
+            for video_url in js_videos:
+                if video_url and video_url not in video_data["video_urls"]:
+                    video_data["video_urls"].append(video_url)
+        except:
+            pass
+        
+        # Method 5: Look for links to video files
+        try:
+            video_links = driver.find_elements(By.XPATH, "//a[contains(@href, '.mp4') or contains(@href, '.webm') or contains(@href, 'video')]")
+            for link in video_links[:3]:
+                try:
+                    href = link.get_attribute('href')
+                    if href and href.startswith('http') and href not in video_data["video_urls"]:
+                        video_data["video_urls"].append(href)
+                except:
+                    continue
+        except:
+            pass
+        
+        # Method 6: Check page source for video URLs (regex search)
+        try:
+            page_source = driver.page_source
+            video_patterns = [
+                r'https?://[^\s"\'<>]+\.mp4',
+                r'https?://[^\s"\'<>]+\.webm',
+                r'https?://[^\s"\'<>]+\.mov',
+                r'https?://[^\s"\'<>]+/video/[^\s"\'<>]+',
+            ]
+            
+            for pattern in video_patterns:
+                matches = re.findall(pattern, page_source)
+                for match in matches[:5]:  # Limit matches per pattern
+                    if match not in video_data["video_urls"]:
+                        video_data["video_urls"].append(match)
+                        print(f"   Found video URL via regex: {match[:50]}...")
+        except:
+            pass
+        
+    except Exception as e:
+        print(f"   Error scraping videos: {e}")
+    
+    # Convert lists to comma-separated strings for CSV storage
+    video_data["video_urls"] = ", ".join(video_data["video_urls"]) if video_data["video_urls"] else "N/A"
+    video_data["video_embeds"] = ", ".join(video_data["video_embeds"]) if video_data["video_embeds"] else "N/A"
+    
+    return video_data
+
 def scrape_game_details(driver, game_url, game_title, download_media_files=True):
     """Scrape detailed information from individual game page"""
     details = {
@@ -149,13 +292,20 @@ def scrape_game_details(driver, game_url, game_title, download_media_files=True)
         "achievements_count": "N/A",
         "reddit_count": "N/A",
         "screenshots": "N/A",
-        "downloaded_images": []
+        "downloaded_images": [],
+        "video_urls": "N/A",
+        "video_embeds": "N/A",
+        "trailer_url": "N/A",
+        "downloaded_videos": []
     }
     
     try:
         driver.get(game_url)
         WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, "body")))
         time.sleep(2)
+        
+        # Scroll to load videos and media
+        scroll_page_incrementally(driver, scroll_times=4, pause=2)
         
         # Extract developer
         try:
@@ -235,6 +385,11 @@ def scrape_game_details(driver, game_url, game_title, download_media_files=True)
             script_dir = os.path.dirname(os.path.abspath(__file__))
             game_media_dir = os.path.join(script_dir, "scraped_data", "rawg_media", safe_title)
             os.makedirs(game_media_dir, exist_ok=True)
+            
+            # Scrape and download videos
+            print(f"   🎬 Scraping videos for: {game_title}")
+            video_data = scrape_videos(driver, game_media_dir, game_title)
+            details.update(video_data)
             
             # Download screenshots
             try:
@@ -351,15 +506,15 @@ def scrape_rawg_games(max_games=100, num_workers=5, scrape_details=True, downloa
         max_games: Target number of games to scrape
         num_workers: Number of parallel threads
         scrape_details: Whether to scrape detailed info from individual pages
-        download_media_files: Whether to download images
+        download_media_files: Whether to download images and videos
         base_url: Starting URL for scraping
     """
     global all_game_data
     all_game_data = []
     
-    print(f"🚀 RAWG.io Scraper Starting")
+    print(f"🚀 RAWG.io Scraper Starting (WITH VIDEO SUPPORT)")
     print(f"   Workers: {num_workers} | Target: {max_games} games")
-    print(f"   Details: {'ON' if scrape_details else 'OFF'} | Media: {'ON' if download_media_files else 'OFF'}\n")
+    print(f"   Details: {'ON' if scrape_details else 'OFF'} | Media (Images+Videos): {'ON' if download_media_files else 'OFF'}\n")
     
     start_time = time.time()
     
@@ -455,9 +610,22 @@ def scrape_rawg_games(max_games=100, num_workers=5, scrape_details=True, downloa
                 scored_games = df[df['metacritic_score'] != 'N/A']
                 print(f"   Games with Metacritic score: {len(scored_games)}")
             
-            if download_media_files and 'downloaded_images' in df.columns:
-                total_images = sum(len(eval(x)) if isinstance(x, str) and x.startswith('[') else 0 for x in df['downloaded_images'])
-                print(f"   Images downloaded: {total_images}")
+            if download_media_files:
+                if 'downloaded_images' in df.columns:
+                    total_images = sum(len(eval(x)) if isinstance(x, str) and x.startswith('[') else 0 for x in df['downloaded_images'])
+                    print(f"   Images downloaded: {total_images}")
+                
+                if 'downloaded_videos' in df.columns:
+                    total_videos = sum(len(eval(x)) if isinstance(x, str) and x.startswith('[') else 0 for x in df['downloaded_videos'])
+                    print(f"   🎬 Videos downloaded: {total_videos}")
+                
+                if 'video_urls' in df.columns:
+                    games_with_videos = df[df['video_urls'] != 'N/A']
+                    print(f"   Games with video URLs: {len(games_with_videos)}")
+                
+                if 'trailer_url' in df.columns:
+                    games_with_trailers = df[df['trailer_url'] != 'N/A']
+                    print(f"   Games with trailers: {len(games_with_trailers)}")
     else:
         print("❌ No games scraped!")
     
@@ -469,10 +637,10 @@ if __name__ == "__main__":
     # Option 1: Quick scrape (basic info only, no media)
     # scrape_rawg_games(max_games=100, num_workers=5, scrape_details=False, download_media_files=False)
     
-    # Option 2: Detailed scrape with media (slower)
+    # Option 2: Detailed scrape with media INCLUDING VIDEOS (slower)
     scrape_rawg_games(
         max_games=500, 
-        num_workers=8, 
+        num_workers=15, 
         scrape_details=True, 
         download_media_files=True,
         base_url="https://rawg.io/"
