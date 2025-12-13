@@ -32,7 +32,8 @@ def create_driver():
     return webdriver.Chrome(service=service, options=options)
 
 def download_media(url, save_dir, filename):
-    """Download images and videos from URLs."""
+    """Download images from URLs (videos are ignored in this version)."""
+    # This function is now only used for images
     try:
         response = requests.get(url, timeout=15, stream=True, headers={
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
@@ -44,75 +45,17 @@ def download_media(url, save_dir, filename):
                     f.write(chunk)
             return filepath
     except Exception as e:
-        print(f"   Error downloading {filename}: {e}")
+        print(f"   Error downloading {filename}: {e}")
     return None
 
-def extract_video_urls(driver):
-    """Extract video URLs from Humble Bundle product pages."""
-    video_urls = []
-    try:
-        time.sleep(2)
-        
-        # Method 1: Look for YouTube embeds in iframes
-        try:
-            iframes = driver.find_elements(By.CSS_SELECTOR, "iframe[src*='youtube']")
-            for iframe in iframes[:3]:
-                src = iframe.get_attribute("src")
-                if src:
-                    # Extract video ID
-                    match = re.search(r'embed/([a-zA-Z0-9_-]+)', src)
-                    if match:
-                        video_id = match.group(1)
-                        video_urls.append(f"https://www.youtube.com/watch?v={video_id}")
-                        print(f"   Found YouTube video: {video_id}")
-        except Exception as e:
-            print(f"   YouTube iframe error: {e}")
-        
-        # Method 2: Search page source for video patterns
-        try:
-            page_source = driver.page_source
-            
-            # YouTube patterns
-            youtube_patterns = [
-                r'youtube\.com/embed/([a-zA-Z0-9_-]+)',
-                r'youtube\.com/watch\?v=([a-zA-Z0-9_-]+)',
-                r'youtu\.be/([a-zA-Z0-9_-]+)'
-            ]
-            
-            for pattern in youtube_patterns:
-                matches = re.findall(pattern, page_source)
-                for video_id in matches[:3]:
-                    url = f"https://www.youtube.com/watch?v={video_id}"
-                    if url not in video_urls:
-                        video_urls.append(url)
-                        print(f"   Found via regex: {video_id}")
-        except Exception as e:
-            print(f"   Regex error: {e}")
-        
-        # Method 3: Look for video elements with direct sources
-        try:
-            video_elements = driver.find_elements(By.CSS_SELECTOR, "video source")
-            for video_elem in video_elements[:3]:
-                src = video_elem.get_attribute("src")
-                if src and src not in video_urls:
-                    video_urls.append(src)
-                    print(f"   Found direct video: {src[:100]}...")
-        except:
-            pass
-            
-    except Exception as e:
-        print(f"   Video extraction error: {e}")
-    
-    return video_urls[:3]
+# Removed extract_video_urls function
 
-def has_media_content(screenshots, videos):
-    """Check if game has valid screenshots or videos."""
-    has_screenshots = screenshots != "N/A" and screenshots.strip() != ""
-    has_videos = videos != "N/A" and videos.strip() != ""
-    return has_screenshots or has_videos
+def has_media_content(screenshots):
+    """Check if game has valid screenshots (videos are ignored)."""
+    return screenshots != "N/A" and screenshots.strip() != ""
 
 def scrape_game_details(driver, game_url, game_title, download_media_files=True):
-    """Scrape detailed information from a Humble Bundle product page."""
+    """Scrape detailed information, excluding all video data."""
     details = {
         "developer": "N/A",
         "publisher": "N/A",
@@ -122,29 +65,57 @@ def scrape_game_details(driver, game_url, game_title, download_media_files=True)
         "description": "N/A",
         "header_image": "N/A",
         "screenshots": "N/A",
-        "videos": "N/A",
+        # "videos" field removed
         "downloaded_images": [],
-        "downloaded_videos": []
+        # "downloaded_videos" field removed
     }
     
     try:
         driver.get(game_url)
+        # Wait for the body to be present
         WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, "body")))
         time.sleep(2)
         
+        # --- FIX: ADD EXPLICIT WAIT FOR DEVELOPER/PUBLISHER LINKS ---
+        try:
+            # Wait for either the developer or publisher link to be present in the side column
+            WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, ".developers-view a, .publishers-view a"))
+            )
+        except TimeoutException:
+            print(f"   ⚠️ Timed out waiting for developer/publisher links for {game_title}.")
+            pass
+        # -----------------------------------------------------------
+
         # Developer
         try:
-            dev_elem = driver.find_element(By.CSS_SELECTOR, ".developers-view a, [href*='developer=']")
+            # Try the specific selector first
+            dev_elem = driver.find_element(By.CSS_SELECTOR, ".developers-view a")
             details["developer"] = dev_elem.text.strip()
-        except:
-            pass
-        
+        except NoSuchElementException:
+            # Fallback to broader selector if the specific one fails
+            try:
+                dev_elem = driver.find_element(By.CSS_SELECTOR, "[href*='developer=']")
+                details["developer"] = dev_elem.text.strip()
+            except:
+                details["developer"] = "N/A"
+        except Exception:
+             details["developer"] = "N/A"
+
         # Publisher
         try:
-            pub_elem = driver.find_element(By.CSS_SELECTOR, ".publishers-view a, [href*='publisher=']")
+            # Try the specific selector first
+            pub_elem = driver.find_element(By.CSS_SELECTOR, ".publishers-view a")
             details["publisher"] = pub_elem.text.strip()
-        except:
-            pass
+        except NoSuchElementException:
+            # Fallback to broader selector if the specific one fails
+            try:
+                pub_elem = driver.find_element(By.CSS_SELECTOR, "[href*='publisher=']")
+                details["publisher"] = pub_elem.text.strip()
+            except:
+                details["publisher"] = "N/A"
+        except Exception:
+             details["publisher"] = "N/A"
         
         # Platforms (Steam, Windows, Mac, Linux, etc.)
         try:
@@ -189,7 +160,7 @@ def scrape_game_details(driver, game_url, game_title, download_media_files=True)
         except:
             pass
         
-        # Media handling
+        # Media handling (Now only handles images/screenshots)
         if download_media_files:
             safe_title = re.sub(r'[<>:"/\\|?*]', '', game_title)[:50]
             script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -248,29 +219,12 @@ def scrape_game_details(driver, game_url, game_title, download_media_files=True)
                 
                 details["screenshots"] = ", ".join(screenshot_urls) if screenshot_urls else "N/A"
             except Exception as e:
-                print(f"   Screenshot error: {e}")
+                print(f"   Screenshot error: {e}")
             
-            # Videos
-            try:
-                video_urls = extract_video_urls(driver)
-                
-                if video_urls:
-                    details["videos"] = ", ".join(video_urls)
-                    
-                    # Save video URLs (YouTube links)
-                    for idx, video_url in enumerate(video_urls):
-                        try:
-                            filepath = os.path.join(game_media_dir, f"video_{idx+1}_url.txt")
-                            with open(filepath, 'w') as f:
-                                f.write(video_url)
-                            details["downloaded_videos"].append(filepath)
-                        except:
-                            continue
-            except Exception as e:
-                print(f"   Video error: {e}")
+            # Video logic removed
         
     except Exception as e:
-        print(f"   Error scraping details for {game_title}: {e}")
+        print(f"   Error scraping details for {game_title}: {e}")
     
     return details
 
@@ -318,7 +272,7 @@ def scrape_product_from_search_page(product):
             "discount_percentage": discount
         }
     except Exception as e:
-        print(f"   Error parsing product: {e}")
+        print(f"   Error parsing product: {e}")
         return None
 
 def scrape_page_range(worker_id, start_page, end_page, scrape_details=True, download_media_files=True):
@@ -332,7 +286,6 @@ def scrape_page_range(worker_id, start_page, end_page, scrape_details=True, down
         for page_num in range(start_page, end_page + 1):
             try:
                 # Humble Bundle uses different URL patterns
-                # Try bestselling first, then on sale
                 urls_to_try = [
                     f"https://www.humblebundle.com/store/search?sort=bestselling&page={page_num}",
                     f"https://www.humblebundle.com/store/search?filter=onsale&sort=bestselling&page={page_num}"
@@ -357,9 +310,9 @@ def scrape_page_range(worker_id, start_page, end_page, scrape_details=True, down
                             details = scrape_game_details(driver, game_data["url"], game_data["title"], download_media_files)
                             game_data.update(details)
                             
-                            # Filter: Only keep games with media
-                            if not has_media_content(game_data.get("screenshots", "N/A"), game_data.get("videos", "N/A")):
-                                print(f"[Worker {worker_id}] ⚠️  Skipping {game_data['title']} - No media")
+                            # Filter: Only keep games with media (screenshots now)
+                            if not has_media_content(game_data.get("screenshots", "N/A")):
+                                print(f"[Worker {worker_id}] ⚠️  Skipping {game_data['title']} - No screenshots")
                                 continue
                         
                         local_data.append(game_data)
@@ -389,9 +342,10 @@ def scrape_humble_bundle(max_games=500, num_workers=5, scrape_details=True, down
     all_game_data = []
     
     print(f"🚀 Humble Bundle Scraper")
-    print(f"   Workers: {num_workers} | Target: {max_games} games")
-    print(f"   Details: {'ON' if scrape_details else 'OFF'} | Media: {'ON' if download_media_files else 'OFF'}")
-    print(f"   Filter: Games WITHOUT media will be DROPPED\n")
+    print(f"   Workers: {num_workers} | Target: {max_games} games")
+    print(f"   Details: {'ON' if scrape_details else 'OFF'} | Media: {'ON' if download_media_files else 'OFF'}")
+    # Filter changed to only check for screenshots
+    print(f"   Filter: Games WITHOUT screenshots will be DROPPED\n")
     
     start_time = time.time()
     
@@ -426,9 +380,9 @@ def scrape_humble_bundle(max_games=500, num_workers=5, scrape_details=True, down
         initial_count = len(df)
         df = df.drop_duplicates(subset=['url'], keep='first')
         
-        # Filter games without media
+        # Filter games without media (only checking screenshots now)
         before_filter = len(df)
-        df = df[df.apply(lambda row: has_media_content(row.get("screenshots", "N/A"), row.get("videos", "N/A")), axis=1)]
+        df = df[df.apply(lambda row: has_media_content(row.get("screenshots", "N/A")), axis=1)]
         after_filter = len(df)
         dropped_count = before_filter - after_filter
         
@@ -440,18 +394,19 @@ def scrape_humble_bundle(max_games=500, num_workers=5, scrape_details=True, down
         print(f"\n{'='*60}")
         print(f"✅ COMPLETE | {len(df)} games | {elapsed:.1f}s | {len(df)/elapsed:.2f} games/s")
         if dropped_count > 0:
-            print(f"🗑️  Dropped {dropped_count} games with no media")
+            print(f"🗑️  Dropped {dropped_count} games with no screenshots")
         print(f"💾 Saved: {output_file}")
         print(f"{'='*60}\n")
         
+        # Display the result columns
         print(df[['title', 'price', 'developer', 'platforms']].head(10).to_string(index=False))
         
         if scrape_details:
             print(f"\n📊 Stats:")
-            print(f"   Free: {len(df[df['price'].str.contains('Free', na=False)])}")
-            print(f"   On sale: {len(df[df['discount_percentage'] != 'N/A'])}")
-            print(f"   With screenshots: {len(df[df['screenshots'] != 'N/A'])}")
-            print(f"   With videos: {len(df[df['videos'] != 'N/A'])}")
+            print(f"   Free: {len(df[df['price'].str.contains('Free', na=False)])}")
+            print(f"   On sale: {len(df[df['discount_percentage'] != 'N/A'])}")
+            print(f"   With screenshots: {len(df[df['screenshots'] != 'N/A'])}")
+            # Removed video stats
     else:
         print("❌ No games scraped")
     
