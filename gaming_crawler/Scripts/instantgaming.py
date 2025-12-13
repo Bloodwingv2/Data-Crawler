@@ -66,7 +66,7 @@ def scrape_game_details(driver, game_url, game_title, download_media_files=True)
         # Create media directory
         safe_title = re.sub(r'[<>:"/\\|?*]', '', game_title)[:50].strip()
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        game_media_dir = os.path.join(script_dir, "scraped_data", "game_media", safe_title)
+        game_media_dir = os.path.join(script_dir, "scraped_data", "instant_gaming_media", safe_title)
         os.makedirs(game_media_dir, exist_ok=True)
         
         # --- DEVELOPER (From meta tag: itemprop="author") ---
@@ -237,7 +237,7 @@ def scrape_game_details(driver, game_url, game_title, download_media_files=True)
     
     return details
 
-def scrape_products_from_page(driver, base_url="https://www.instant-gaming.com/de/", max_games=50):
+def scrape_products_from_page(driver, base_url, max_games):
     """Scrape game listings from Instant Gaming homepage."""
     print(f"\n{'#'*70}")
     print(f"LOADING INSTANT GAMING HOMEPAGE")
@@ -297,7 +297,7 @@ def scrape_products_from_page(driver, base_url="https://www.instant-gaming.com/d
     print(f"\n✓ Found {len(unique_games)} unique games")
     return unique_games[:max_games]
 
-def create_driver(headless=False):
+def create_driver(headless):
     """Create Chrome driver."""
     options = webdriver.ChromeOptions()
     if headless:
@@ -310,67 +310,93 @@ def create_driver(headless=False):
     driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
     return driver
 
-# --- MAIN EXECUTION ---
-if __name__ == "__main__":
+def run_scraper(base_url, max_games, download_media, headless):
+    """
+    Main scraper function.
+    
+    Args:
+        base_url (str): URL of the Instant Gaming page to scrape
+        max_games (int): Maximum number of games to scrape
+        download_media (bool): Whether to download images and media
+        headless (bool): Whether to run browser in headless mode
+    
+    Returns:
+        pd.DataFrame: DataFrame containing scraped game data
+    """
     print("\n" + "="*70)
-    print("INSTANT GAMING SCRAPER - FIXED VERSION")
+    print("INSTANT GAMING SCRAPER")
+    print("="*70 + "\n")
+    print(f"Configuration:")
+    print(f"  Base URL: {base_url}")
+    print(f"  Max Games: {max_games}")
+    print(f"  Download Media: {download_media}")
+    print(f"  Headless Mode: {headless}")
     print("="*70 + "\n")
     
-    # Configuration
-    INSTANT_GAMING_URL = "https://www.instant-gaming.com/de/"
-    MAX_GAMES = 20  # Limit for testing
-    DOWNLOAD_MEDIA = True
-    HEADLESS_MODE = True  # Set True to hide browser
-    
     # Create driver
-    driver = create_driver(headless=HEADLESS_MODE)
+    driver = create_driver(headless=headless)
     
     try:
         # Step 1: Get game list from homepage
-        games = scrape_products_from_page(driver, INSTANT_GAMING_URL, MAX_GAMES)
+        games = scrape_products_from_page(driver, base_url, max_games)
         
         if not games:
             print("✗ No games found! Check selectors.")
-        else:
-            # Step 2: Scrape each game
-            all_results = []
+            return None
+        
+        # Step 2: Scrape each game
+        all_results = []
+        
+        for idx, game in enumerate(games, 1):
+            print(f"\n\n[{idx}/{len(games)}] Processing: {game['title']}")
             
-            for idx, game in enumerate(games, 1):
-                print(f"\n\n[{idx}/{len(games)}] Processing: {game['title']}")
-                
-                details = scrape_game_details(
-                    driver,
-                    game['url'],
-                    game['title'],
-                    download_media_files=DOWNLOAD_MEDIA
-                )
-                
-                all_results.append(details)
-                
-                # Save progress every 5 games
-                if idx % 5 == 0:
-                    df = pd.DataFrame(all_results)
-                    df.to_csv("scraped_data/instant_gaming_progress.csv", index=False, encoding='utf-8')
-                    print(f"\n💾 Progress saved: {idx} games")
-                
-                # Small delay between requests
-                time.sleep(2)
+            details = scrape_game_details(
+                driver,
+                game['url'],
+                game['title'],
+                download_media_files=download_media
+            )
             
-            # Final save
-            df = pd.DataFrame(all_results)
-            df.to_csv("scraped_data/instant_gaming_complete.csv", index=False, encoding='utf-8')
+            all_results.append(details)
             
-            print("\n" + "="*70)
-            print("SCRAPING COMPLETE!")
-            print(f"Total games scraped: {len(all_results)}")
-            print(f"Results saved to: scraped_data/instant_gaming_complete.csv")
-            print("="*70)
+            # Small delay between requests
+            time.sleep(2)
+        
+        # Final save
+        df = pd.DataFrame(all_results)
+        df.to_csv("scraped_data/instant_gaming_data.csv", index=False, encoding='utf-8')
+        
+        print("\n" + "="*70)
+        print("SCRAPING COMPLETE!")
+        print(f"Total games scraped: {len(all_results)}")
+        print(f"Results saved to: scraped_data/instant_gaming_data.csv")
+        print("="*70)
+        
+        return df
     
     except Exception as e:
         print(f"\n✗✗✗ FATAL ERROR: {e}")
         import traceback
         traceback.print_exc()
+        return None
     
     finally:
         driver.quit()
         print("\nBrowser closed.")
+
+
+# --- MAIN EXECUTION ---
+if __name__ == "__main__":
+    # Configuration variables
+    INSTANT_GAMING_URL = "https://www.instant-gaming.com/de/"
+    MAX_GAMES = 20
+    DOWNLOAD_MEDIA = True
+    HEADLESS_MODE = True
+    
+    # Run the scraper
+    results_df = run_scraper(
+        base_url=INSTANT_GAMING_URL,
+        max_games=MAX_GAMES,
+        download_media=DOWNLOAD_MEDIA,
+        headless=HEADLESS_MODE
+    )
