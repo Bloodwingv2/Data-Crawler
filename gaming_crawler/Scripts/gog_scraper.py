@@ -1,699 +1,489 @@
 #!/usr/bin/env python3
 """
-gog_scraper.py
+GOG Scraper - Playwright Version (MUCH better than Selenium!)
+Faster, more reliable, better dynamic content handling
 
-Single-file Selenium-based GOG scraper that downloads header image, screenshots and direct mp4 trailers,
-and writes a detailed CSV. Configure via command-line args or constants below.
-ENHANCED: Filters out games with no screenshots and no videos
-
-Requirements:
-  pip install selenium webdriver-manager pandas requests
-
-Notes:
-  - Keep num_workers modest (2-6) to avoid anti-bot triggers. Increase slowly.
-  - For debugging, set headless=False.
+Install: pip install playwright pandas requests
+Then: playwright install chromium
 """
 
-import argparse
-import os
-import re
-import time
-import random
-import csv
+import os, re, time, random, asyncio, json
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
-
 import requests
 import pandas as pd
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
-# -----------------------
-# Configuration defaults
-# -----------------------
-DEFAULT_HEADLESS = True
-DEFAULT_WORKERS = 3
-DEFAULT_MAX_GAMES = 200
-DEFAULT_PAGE_SLEEP = (1.0, 2.5)  # random delay between actions
-DEFAULT_REQUEST_TIMEOUT = 20
-MAX_SCREENSHOTS = 6
-MAX_VIDEOS = 3
-GAMES_PER_PAGE = 48  # default GOG layout, adjust if needed
+CFG = {
+    'workers': 3,
+    'headless': True,
+    'page_timeout': 30000,
+    'wait_after_load': 2000,
+    'max_screenshots': 6,
+    'max_videos': 3,
+    'download_media': True,
+}
 
-# Shared state and locks
-all_game_data = []
-data_lock = Lock()
+def log(msg): print(f"[{time.strftime('%H:%M:%S')}] {msg}")
 
-# -----------------------
-# Utilities
-# -----------------------
-def sanitize_filename(name: str, maxlen: int = 80) -> str:
-    name = re.sub(r'[<>:"/\\|?*\x00-\x1F]', '', name)
-    name = name.strip()
-    return name[:maxlen] if len(name) > maxlen else name
+def sanitize(name, maxlen=80):
+    return re.sub(r'[<>:"/\\|?*\x00-\x1F]', '', name).strip()[:maxlen]
 
-def safe_getattr(elem, attr):
+def parse_price(txt):
+    if not txt: return "N/A", "N/A", "N/A"
+    txt = txt.strip().lower()
+    if 'free' in txt: return "Free", "N/A", "N/A"
+    disc = re.search(r'-(\d+)%', txt)
+    prices = re.findall(r'[€$£¥]\s*[\d,]+\.?\d*', txt)
+    return (prices[0].strip() if prices else "N/A",
+            prices[1].strip() if len(prices) > 1 else "N/A",
+            disc.group(1) + "%" if disc else "N/A")
+
+def download_file(url, path, timeout=15):
+    if not url or url == "N/A" or os.path.exists(path):
+        return path if os.path.exists(path) else None
     try:
-        return elem.get_attribute(attr)
-    except:
-        return None
-
-def rand_sleep(a=DEFAULT_PAGE_SLEEP[0], b=DEFAULT_PAGE_SLEEP[1]):
-    time.sleep(random.uniform(a, b))
-
-def has_media_content(screenshots, videos):
-    """Check if game has valid screenshots or videos."""
-    has_screenshots = screenshots != "N/A" and screenshots.strip() != ""
-    has_videos = videos != "N/A" and videos.strip() != ""
-    return has_screenshots or has_videos
-
-# -----------------------
-# Downloader with retries
-# -----------------------
-def download_media(url: str, save_dir: str, filename: str, timeout: int = DEFAULT_REQUEST_TIMEOUT, max_retries: int = 3):
-    if not url or url == "N/A":
-        return None
-    try:
-        os.makedirs(save_dir, exist_ok=True)
-        path = os.path.join(save_dir, filename)
-        # Skip if already downloaded
-        if os.path.exists(path) and os.path.getsize(path) > 1024:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        r = requests.get(url, stream=True, timeout=timeout, headers=headers)
+        if r.status_code == 200:
+            with open(path, 'wb') as f:
+                for chunk in r.iter_content(8192):
+                    f.write(chunk)
             return path
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-        for attempt in range(1, max_retries + 1):
-            try:
-                with requests.get(url, stream=True, timeout=timeout, headers=headers) as r:
-                    if r.status_code == 200:
-                        with open(path, 'wb') as fh:
-                            for chunk in r.iter_content(chunk_size=8192):
-                                if chunk:
-                                    fh.write(chunk)
-                        return path
-                    else:
-                        # Non-200: break early for non-downloadable sources
-                        break
-            except Exception:
-                if attempt == max_retries:
-                    break
-                time.sleep(1 + attempt)
-        return None
-    except Exception:
-        return None
+    except: pass
+    return None
 
-# -----------------------
-# Price parsing
-# -----------------------
-def parse_price(txt: str):
-    if not txt:
-        return "N/A", "N/A", "N/A"
-    t = txt.strip()
-    if 'free' in t.lower():
-        return "Free", "N/A", "N/A"
-    disc = re.search(r'-(\d+)%', t)
-    prices = re.findall(r'[€$£¥]\s*[\d,]+\.?\d*', t)
-    price = prices[0].strip() if prices else "N/A"
-    orig = prices[1].strip() if len(prices) > 1 else "N/A"
-    discp = (disc.group(1) + "%") if disc else "N/A"
-    return price, orig, discp
-
-# -----------------------
-# WebDriver factory
-# -----------------------
-def create_driver(headless=True):
-    opts = webdriver.ChromeOptions()
-    if headless:
-        opts.add_argument('--headless=new')
-    opts.add_argument('--no-sandbox')
-    opts.add_argument('--disable-dev-shm-usage')
-    # Reasonable UA
-    opts.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-    opts.add_experimental_option('useAutomationExtension', False)
-
-    svc = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=svc, options=opts)
-    # Stealth small patch
+async def scrape_list_page(page, page_num, wid):
+    """Scrape game list from a catalog page"""
     try:
-        driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-            'source': "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        })
-    except Exception:
-        pass
-    driver.set_page_load_timeout(60)
-    return driver
-
-def handle_cookies(driver):
-    # Try a bunch of common cookie button selectors
-    selectors = [
-        "button.cookie-consent__accept",
-        "#onetrust-accept-btn-handler",
-        "button[class*='cookie']",
-        "button[data-testid='cookie-accept']",
-        "button[title*='Accept']",
-        "button[aria-label*='accept']"
-    ]
-    for sel in selectors:
+        url = f"https://www.gog.com/en/games?order=desc:releaseDate&page={page_num}"
+        log(f"W{wid} → Page {page_num}")
+        
+        await page.goto(url, wait_until="domcontentloaded", timeout=CFG['page_timeout'])
+        
+        # Handle cookies
         try:
-            btn = WebDriverWait(driver, 2).until(EC.element_to_be_clickable((By.CSS_SELECTOR, sel)))
-            btn.click()
-            rand_sleep(0.5, 1.0)
-            return True
-        except Exception:
-            continue
-    return False
-
-# -----------------------
-# Scrape helpers
-# -----------------------
-def scrape_game_card(card):
-    """
-    Extract quick info from a game 'card' element (title, url, price)
-    Return dict or None
-    """
-    try:
-        data = {"title": "N/A", "url": "N/A", "price": "N/A", "original_price": "N/A", "discount_percentage": "N/A"}
-        # URL: card may be an <a> or contain <a>
-        href = safe_getattr(card, "href")
-        if not href:
+            cookie_btn = page.locator("button.cookie-consent__accept, #onetrust-accept-btn-handler").first
+            if await cookie_btn.is_visible(timeout=2000):
+                await cookie_btn.click()
+                await page.wait_for_timeout(500)
+        except: pass
+        
+        # Wait for games to load
+        await page.wait_for_selector("a[href*='/game/']", timeout=15000)
+        await page.wait_for_timeout(CFG['wait_after_load'])
+        
+        # Scroll to load lazy content
+        for i in range(5):
+            await page.evaluate(f"window.scrollTo(0, {i * 800})")
+            await page.wait_for_timeout(300)
+        
+        await page.evaluate("window.scrollTo(0, 0)")
+        await page.wait_for_timeout(500)
+        
+        # Get all game links
+        game_links = await page.locator("a[href*='/game/']").all()
+        
+        # Extract unique games
+        games = []
+        seen_urls = set()
+        
+        for link in game_links:
             try:
-                a = card.find_element(By.CSS_SELECTOR, "a[href*='/game/']")
-                href = a.get_attribute("href")
-            except:
-                href = None
-        if href and '/game/' in href:
-            if href.startswith("http"):
-                data["url"] = href
-            else:
-                data["url"] = "https://www.gog.com" + href
-        # Title
-        try:
-            title = card.find_element(By.CSS_SELECTOR, ".product-tile__title, [class*='title']").text.strip()
-            if title:
-                data["title"] = title
-        except:
-            try:
-                aria = safe_getattr(card, "aria-label")
-                if aria:
-                    data["title"] = aria.strip()
-            except:
-                pass
-        # Price
-        try:
-            price_elem = card.find_element(By.CSS_SELECTOR, ".product-tile__prices, [class*='price']")
-            price_txt = price_elem.text.strip()
-            p, o, d = parse_price(price_txt)
-            data["price"], data["original_price"], data["discount_percentage"] = p, o, d
-        except:
-            pass
-
-        return data if data["url"] != "N/A" else None
-    except Exception:
-        return None
-
-def extract_details_from_page(driver, url, title, download_media_flag=True):
-    """
-    Visit the game page and extract details + download media into folder.
-    Returns a dict with detailed fields.
-    """
-    details = {
-        "title": title,
-        "url": url,
-        "release_date": "N/A",
-        "genres": "N/A",
-        "categories": "N/A",
-        "platforms": "N/A",
-        "review_summary": "N/A",
-        "description": "N/A",
-        "developer": "N/A",
-        "publisher": "N/A",
-        "system_requirements_windows": "N/A",
-        "system_requirements_mac": "N/A",
-        "system_requirements_linux": "N/A",
-        "header_image": "N/A",
-        "screenshots": "N/A",
-        "videos": "N/A",
-        "multiplayer": "No",
-        "singleplayer": "No",
-        "downloaded_images": [],
-        "downloaded_videos": []
-    }
-    try:
-        driver.get(url)
-        WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-        rand_sleep()
-        handle_cookies(driver)
-        # Scroll a bit so lazy-loaded media appears
-        for pos in (500, 1200, 2200, 3000):
-            driver.execute_script(f"window.scrollTo(0, {pos});")
-            rand_sleep(0.2, 0.6)
-        driver.execute_script("window.scrollTo(0, 0);")
-        rand_sleep(0.2, 0.6)
-
-        # ======= DETAILS rows (developer, publisher, genres, release, platforms, features) =======
-        try:
-            rows = driver.find_elements(By.CSS_SELECTOR, ".details__row, [class*='details-row'], [data-testid='game-info-row']")
-            for row in rows:
+                href = await link.get_attribute("href")
+                if not href or '/game/' not in href:
+                    continue
+                
+                url = href if href.startswith("http") else f"https://www.gog.com{href}"
+                
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                
+                # Extract title
+                title = None
                 try:
-                    label = row.find_element(By.CSS_SELECTOR, ".details__category, .label, .row-title").text.strip().lower()
-                    content = ""
+                    title_elem = link.locator(".product-title, [class*='title']").first
+                    title = await title_elem.text_content(timeout=500)
+                    title = title.strip() if title else None
+                except: pass
+                
+                if not title:
                     try:
-                        content = row.find_element(By.CSS_SELECTOR, ".details__content, .value, .row-content").text.strip()
-                    except:
-                        pass
-                    if 'genre' in label and content:
-                        details["genres"] = ", ".join([g.strip() for g in content.split("\n") if g.strip()])
-                    elif 'tag' in label or 'tags' in label:
-                        details["categories"] = ", ".join([g.strip() for g in content.split("\n") if g.strip()][:20])
-                    elif 'release' in label and content:
-                        details["release_date"] = content
-                    elif 'company' in label and content:
-                        parts = [p.strip() for p in content.split("\n") if p.strip()]
-                        if len(parts) >= 1: details["developer"] = parts[0]
-                        if len(parts) >= 2: details["publisher"] = parts[1]
-                    elif 'works on' in label or 'platform' in label:
-                        ptxt = content.lower()
-                        plats = []
-                        if 'windows' in ptxt: plats.append("Windows")
-                        if 'mac' in ptxt or 'os x' in ptxt: plats.append("Mac")
-                        if 'linux' in ptxt: plats.append("Linux")
-                        if plats:
-                            details["platforms"] = ", ".join(plats)
-                    elif 'game feature' in label or 'features' in label:
-                        feats = row.find_elements(By.CSS_SELECTOR, ".details__feature, .feature, .tag")
-                        for f in feats:
-                            try:
-                                ft = f.text.lower()
-                                if 'single' in ft: details["singleplayer"] = "Yes"
-                                if 'multi' in ft or 'co-op' in ft: details["multiplayer"] = "Yes"
-                            except:
-                                continue
-                except:
-                    continue
-        except:
-            pass
-
-        # ======= DESCRIPTION =======
-        try:
-            desc_selectors = [
-                ".description", "[class*='description']", ".productcard-description", "[data-testid='description']"
-            ]
-            for sel in desc_selectors:
+                        title = await link.get_attribute("aria-label")
+                    except: pass
+                
+                if not title:
+                    game_slug = url.split('/game/')[-1].strip('/')
+                    title = game_slug.replace('_', ' ').replace('-', ' ').title()
+                
+                # Extract price
+                price, orig, disc = "N/A", "N/A", "N/A"
                 try:
-                    elem = driver.find_element(By.CSS_SELECTOR, sel)
-                    txt = elem.text.strip()
-                    if len(txt) > 50:
-                        details["description"] = txt[:1000] + ("..." if len(txt) > 1000 else "")
-                        break
-                except:
-                    continue
-            # fallback: longest paragraph
-            if details["description"] == "N/A":
-                paras = [p.text.strip() for p in driver.find_elements(By.TAG_NAME, "p") if len(p.text.strip()) > 80]
-                if paras:
-                    long = max(paras, key=len)
-                    details["description"] = long[:1000] + ("..." if len(long) > 1000 else "")
-        except:
-            pass
-
-        # ======= Reviews / rating =======
-        try:
-            revs = driver.find_elements(By.CSS_SELECTOR, "[class*='rating'], .product-rating, [data-testid='rating']")
-            for r in revs:
-                txt = r.text.strip()
-                if txt and len(txt) < 120 and any(ch in txt.lower() for ch in ['star', '%', 'rating', 'positive']):
-                    details["review_summary"] = txt
-                    break
-        except:
-            pass
-
-        # ======= SYSTEM REQUIREMENTS =======
-        try:
-            driver.execute_script("window.scrollTo(0, 2200);")
-            rand_sleep(0.3, 0.7)
-            req_candidates = driver.find_elements(By.CSS_SELECTOR, "[class*='system'], [class*='requirements'], [data-testid='system-requirements']")
-            req_text = ""
-            for rc in req_candidates:
-                try:
-                    txt = rc.text.strip()
-                    if len(txt) > len(req_text):
-                        req_text = txt
-                except:
-                    continue
-            if req_text:
-                # crude OS splitting using regex
-                for os_name, patterns in [
-                    ("windows", [r'Windows[:\s\-]+(.+?)(?=Mac|Linux|$)', r'PC[:\s\-]+(.+?)(?=Mac|Linux|$)']),
-                    ("mac", [r'Mac[:\s\-]+(.+?)(?=Linux|Windows|$)', r'OS X[:\s\-]+(.+?)(?=Linux|Windows|$)']),
-                    ("linux", [r'Linux[:\s\-]+(.+?)(?=Mac|Windows|$)'])
-                ]:
-                    for pat in patterns:
-                        m = re.search(pat, req_text, re.DOTALL | re.IGNORECASE)
-                        if m:
-                            details[f"system_requirements_{os_name}"] = m.group(1).strip()[:800]
-                            break
-        except:
-            pass
-
-        # ======= MEDIA DOWNLOAD =======
-        media_dir = None
-        if download_media_flag:
-            safe = sanitize_filename(title) or "game"
-            media_dir = os.path.join("scraped_data", "game_media_gog", safe)
-            os.makedirs(media_dir, exist_ok=True)
-
-            # HEADER IMAGE - multiple fallbacks
-            header_selectors = [
-                "img[src*='cover']",
-                "picture source[srcset*='cover']",
-                "meta[property='og:image']",
-                "img[class*='hero']",
-                ".productcard-cover img",
-                "img[src*='/cover/']",
-                "img[class*='cover']"
-            ]
-            header_saved = False
-            for sel in header_selectors:
-                try:
-                    if sel.startswith("meta"):
-                        elem = driver.find_element(By.CSS_SELECTOR, sel)
-                        img_url = safe_getattr(elem, "content") or safe_getattr(elem, "src")
-                    else:
-                        elem = driver.find_element(By.CSS_SELECTOR, sel)
-                        img_url = safe_getattr(elem, "src") or safe_getattr(elem, "srcset") or safe_getattr(elem, "data-src")
-                    if img_url and img_url.startswith("http"):
-                        # attempt to get a higher-res variant
-                        img_url = re.sub(r'([_-])(256|512)\.', r'\g<1>1024.', img_url)
-                        details["header_image"] = img_url
-                        dl = download_media(img_url, media_dir, "header.jpg")
-                        if dl:
-                            details["downloaded_images"].append(dl)
-                        header_saved = True
-                        break
-                except:
-                    continue
-
-            # SCREENSHOTS / GALLERY
-            try:
-                screenshot_selectors = [
-                    "[data-testid='media-gallery'] img",
-                    "img[src*='screenshots']",
-                    "img[src*='/gallery/']",
-                    ".media-gallery img",
-                    ".screenshot img",
-                    ".screenshot"
-                ]
-                screenshots = []
-                for sel in screenshot_selectors:
-                    elems = driver.find_elements(By.CSS_SELECTOR, sel)
-                    if elems:
-                        for idx, img in enumerate(elems[:MAX_SCREENSHOTS]):
-                            url = safe_getattr(img, "src") or safe_getattr(img, "srcset") or safe_getattr(img, "data-src")
-                            if not url:
-                                continue
-                            if not url.startswith("http"):
-                                continue
-                            url = re.sub(r'([_-])(256|512)\.', r'\g<1>1024.', url)
-                            if url in screenshots:
-                                continue
-                            screenshots.append(url)
-                            dl = download_media(url, media_dir, f"screenshot_{len(screenshots)}.jpg")
-                            if dl:
-                                details["downloaded_images"].append(dl)
-                        if screenshots:
-                            details["screenshots"] = ", ".join(screenshots)
-                        break
-            except:
-                pass
-
-            # VIDEOS / TRAILERS
-            try:
-                vid_selectors = [
-                    "video source",
-                    "video[src]",
-                    "iframe[src*='youtube']",
-                    "iframe[src*='vimeo']",
-                    "a[href*='.mp4']"
-                ]
-                vids = []
-                for sel in vid_selectors:
-                    elems = driver.find_elements(By.CSS_SELECTOR, sel)
-                    if elems:
-                        for elem in elems[:MAX_VIDEOS]:
-                            url = safe_getattr(elem, "src") or safe_getattr(elem, "href") or safe_getattr(elem, "data-src")
-                            if not url:
-                                continue
-                            if url in vids:
-                                continue
-                            vids.append(url)
-                            # Download only direct mp4 links (youtube/vimeo iframes are stored as links)
-                            if url.lower().endswith(".mp4"):
-                                dl = download_media(url, media_dir, f"video_{len(details['downloaded_videos'])+1}.mp4")
-                                if dl:
-                                    details["downloaded_videos"].append(dl)
-                        if vids:
-                            details["videos"] = ", ".join(vids)
-                        break
-            except:
-                pass
-
-        # done
-    except Exception:
-        pass
-
-    return details
-
-# -----------------------
-# Page worker
-# -----------------------
-def scrape_pages(worker_id: int, start_page: int, end_page: int, headless=True, scrape_details=True, download_media=True):
-    driver = create_driver(headless=headless)
-    local_results = []
-    try:
-        for page in range(start_page, end_page + 1):
-            try:
-                list_url = f"https://www.gog.com/en/games?order=desc:releaseDate&page={page}"
-                print(f"[W{worker_id}] Fetching page {page} -> {list_url}")
-                driver.get(list_url)
-                WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-                rand_sleep()
-
-                # dismiss cookies if present
-                handle_cookies(driver)
-
-                # Scroll to trigger lazy load
-                for y in (800, 1500, 2500):
-                    driver.execute_script(f"window.scrollTo(0, {y});")
-                    rand_sleep(0.3, 0.8)
-
-                # Find cards
-                card_selectors = [
-                    "a.product-tile__content",
-                    "a[href*='/game/']",
-                    "[class*='product-tile']",
-                    "[data-testid='product-tile']"
-                ]
-                cards = []
-                for sel in card_selectors:
-                    try:
-                        cards = driver.find_elements(By.CSS_SELECTOR, sel)
-                        if cards:
-                            break
-                    except:
-                        continue
-
-                if not cards:
-                    print(f"[W{worker_id}] Page {page}: no cards found")
-                    continue
-
-                print(f"[W{worker_id}] Page {page}: found {len(cards)} cards")
-                for card in cards:
-                    g = scrape_game_card(card)
-                    if not g:
-                        continue
-                    # Get details if requested
-                    if scrape_details and g.get("url"):
-                        details = extract_details_from_page(driver, g["url"], g.get("title", "N/A"), download_media_flag=download_media)
-                        # merge
-                        merged = {**g, **details}
-                        
-                        # Filter: Only keep games with screenshots or videos
-                        if not has_media_content(merged.get("screenshots", "N/A"), merged.get("videos", "N/A")):
-                            print(f"[W{worker_id}] ⚠️  Skipping {merged.get('title', 'Unknown')} - No media content")
-                            continue
-                    else:
-                        merged = g
-                    local_results.append(merged)
-                    rand_sleep(0.2, 0.8)
-
-                print(f"[W{worker_id}] Page {page}: collected {len(local_results)} items so far")
-                rand_sleep(0.5, 1.4)
+                    price_elem = link.locator("[class*='price']").first
+                    price_text = await price_elem.text_content(timeout=500)
+                    price, orig, disc = parse_price(price_text)
+                except: pass
+                
+                games.append({
+                    "title": title,
+                    "url": url,
+                    "price": price,
+                    "original_price": orig,
+                    "discount_percentage": disc
+                })
+                
             except Exception as e:
-                print(f"[W{worker_id}] Page {page} error: {e}")
                 continue
-    finally:
-        driver.quit()
-
-    # append to global list
-    with data_lock:
-        all_game_data.extend(local_results)
-    print(f"[W{worker_id}] Finished pages {start_page}-{end_page} -> {len(local_results)} games")
-    return local_results
-
-# -----------------------
-# Orchestrator
-# -----------------------
-def scrape_gog_games(max_games=DEFAULT_MAX_GAMES, num_workers=DEFAULT_WORKERS, headless=DEFAULT_HEADLESS,
-                     scrape_details=True, download_media=True):
-    global all_game_data
-    all_game_data = []
-
-    total_pages = max(1, (max_games + GAMES_PER_PAGE - 1) // GAMES_PER_PAGE)
-    pages_per_worker = max(1, (total_pages + num_workers - 1) // num_workers)
-
-    print(f"🚀 Starting GOG scrape: max_games={max_games}, pages={total_pages}, workers={num_workers}")
-    print(f"🔍 Details: {'ON' if scrape_details else 'OFF'} | Media: {'ON' if download_media else 'OFF'}")
-    print(f"🎬 Filter: Games WITHOUT screenshots/videos will be DROPPED\n")
-    
-    start_time = time.time()
-    
-    with ThreadPoolExecutor(max_workers=num_workers) as exe:
-        futures = []
-        for i in range(num_workers):
-            sp = i * pages_per_worker + 1
-            ep = min(total_pages, sp + pages_per_worker - 1)
-            if sp > total_pages:
-                break
-            futures.append(exe.submit(scrape_pages, i + 1, sp, ep, headless, scrape_details, download_media))
-
-        for f in as_completed(futures):
-            try:
-                f.result()
-            except Exception as e:
-                print("Worker error:", e)
-
-    elapsed = time.time() - start_time
-
-    # postprocess global results and write CSV
-    if not all_game_data:
-        print("❌ No games scraped.")
+        
+        log(f"W{wid} → Page {page_num}: Found {len(games)} games")
+        return games
+        
+    except Exception as e:
+        log(f"W{wid} → Page {page_num} ERROR: {e}")
         return []
 
-    df = pd.DataFrame(all_game_data)
+async def scrape_game_details(page, url, title, wid):
+    """Scrape full details from game page"""
+    details = {
+        "release_date": "N/A",
+        "genres": "N/A",
+        "platforms": "N/A",
+        "developer": "N/A",
+        "publisher": "N/A",
+        "description": "N/A",
+        "screenshots": [],
+        "videos": [],
+        "header_image": "N/A"
+    }
     
-    # dedupe by URL if present
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=CFG['page_timeout'])
+        await page.wait_for_timeout(1500)
+        
+        # Handle cookies
+        try:
+            cookie_btn = page.locator("button.cookie-consent__accept").first
+            if await cookie_btn.is_visible(timeout=1000):
+                await cookie_btn.click()
+                await page.wait_for_timeout(300)
+        except: pass
+        
+        # Scroll to load content
+        for i in range(4):
+            await page.evaluate(f"window.scrollTo(0, {i * 1000})")
+            await page.wait_for_timeout(300)
+        await page.evaluate("window.scrollTo(0, 0)")
+        await page.wait_for_timeout(500)
+        
+        # Extract details from rows
+        try:
+            rows = await page.locator(".details__row, [class*='details-row'], .table__row").all()
+            
+            for row in rows:
+                try:
+                    label = await row.locator(".details__category, .label, [class*='category']").first.text_content(timeout=500)
+                    content = await row.locator(".details__content, .value, [class*='content']").first.text_content(timeout=500)
+                    
+                    if not label or not content:
+                        continue
+                    
+                    label = label.strip().lower()
+                    content = content.strip()
+                    
+                    if 'genre' in label and content:
+                        genres = [g.strip() for g in content.split('\n') if g.strip()]
+                        details["genres"] = ", ".join(genres[:10])
+                    
+                    elif 'release' in label:
+                        details["release_date"] = content
+                    
+                    elif 'developer' in label or 'company' in label:
+                        parts = [p.strip() for p in content.split('\n') if p.strip()]
+                        if parts: details["developer"] = parts[0]
+                        if len(parts) > 1: details["publisher"] = parts[1]
+                    
+                    elif 'publisher' in label and details["publisher"] == "N/A":
+                        details["publisher"] = content
+                    
+                    elif 'works on' in label or 'platform' in label:
+                        plats = []
+                        cl = content.lower()
+                        if 'windows' in cl: plats.append("Windows")
+                        if 'mac' in cl or 'os x' in cl: plats.append("Mac")
+                        if 'linux' in cl: plats.append("Linux")
+                        if plats: details["platforms"] = ", ".join(plats)
+                
+                except: continue
+        except: pass
+        
+        # Fallback: genres from tags
+        if details["genres"] == "N/A":
+            try:
+                genre_links = await page.locator("a[href*='/games?genres='], .tag, [class*='genre']").all()
+                genres = []
+                for link in genre_links[:10]:
+                    text = await link.text_content(timeout=300)
+                    if text and len(text.strip()) < 30:
+                        genres.append(text.strip())
+                if genres:
+                    details["genres"] = ", ".join(genres)
+            except: pass
+        
+        # Fallback: platforms from icons
+        if details["platforms"] == "N/A":
+            try:
+                icons = await page.locator("[class*='platform'], [class*='os-icon']").all()
+                plats = []
+                for icon in icons:
+                    cls = await icon.get_attribute("class") or ""
+                    title_attr = await icon.get_attribute("title") or ""
+                    combined = (cls + " " + title_attr).lower()
+                    if 'windows' in combined and "Windows" not in plats: plats.append("Windows")
+                    if ('mac' in combined or 'apple' in combined) and "Mac" not in plats: plats.append("Mac")
+                    if 'linux' in combined and "Linux" not in plats: plats.append("Linux")
+                if plats: details["platforms"] = ", ".join(plats)
+            except: pass
+        
+        # Description
+        try:
+            desc_elem = page.locator(".description, [class*='description'], .game-description").first
+            desc = await desc_elem.text_content(timeout=2000)
+            if desc and len(desc.strip()) > 50:
+                details["description"] = desc.strip()[:800]
+        except: pass
+        
+        # Header image
+        try:
+            img = await page.locator("meta[property='og:image']").first.get_attribute("content", timeout=2000)
+            if img and img.startswith("http"):
+                details["header_image"] = img
+        except:
+            try:
+                img = await page.locator("img[src*='cover']").first.get_attribute("src", timeout=2000)
+                if img and img.startswith("http"):
+                    details["header_image"] = img
+            except: pass
+        
+        # Screenshots
+        try:
+            img_elems = await page.locator("img[src*='screenshots'], img[src*='/gallery/'], .media-gallery img").all()
+            for img in img_elems[:CFG['max_screenshots']]:
+                src = await img.get_attribute("src")
+                if src and src.startswith("http") and src not in details["screenshots"]:
+                    src = re.sub(r'([_-])(256|512|thumb)\.', r'\g<1>1024.', src)
+                    details["screenshots"].append(src)
+        except: pass
+        
+        # Videos
+        try:
+            video_elems = await page.locator("video source, video[src], source[src*='.mp4']").all()
+            for vid in video_elems[:CFG['max_videos']]:
+                src = await vid.get_attribute("src")
+                if src and src not in details["videos"]:
+                    details["videos"].append(src)
+        except: pass
+        
+        return details
+        
+    except Exception as e:
+        log(f"W{wid} ⚠️  Detail error for {title}: {str(e)[:50]}")
+        return details
+
+async def worker(context, pages_to_scrape, wid):
+    """Worker that processes assigned pages"""
+    page = await context.new_page()
+    all_games = []
+    
+    try:
+        for page_num in pages_to_scrape:
+            # Get list of games
+            games = await scrape_list_page(page, page_num, wid)
+            
+            # Get details for each game
+            for idx, game in enumerate(games, 1):
+                try:
+                    details = await scrape_game_details(page, game['url'], game['title'], wid)
+                    game.update(details)
+                    
+                    # Download media
+                    if CFG['download_media']:
+                        game = download_media(game)
+                    
+                    all_games.append(game)
+                    
+                    if idx % 5 == 0:
+                        log(f"W{wid} → Page {page_num}: {idx}/{len(games)} games processed")
+                    
+                    await page.wait_for_timeout(random.randint(300, 700))
+                    
+                except Exception as e:
+                    log(f"W{wid} ⚠️  Error on {game.get('title', 'Unknown')}: {str(e)[:30]}")
+                    all_games.append(game)
+                    continue
+            
+            log(f"W{wid} → Page {page_num}: ✓ {len(games)} games (Total: {len(all_games)})")
+            await page.wait_for_timeout(random.randint(2000, 4000))
+        
+    finally:
+        await page.close()
+    
+    log(f"W{wid} → FINISHED: {len(all_games)} games")
+    return all_games
+
+def download_media(game_data, base_dir="scraped_data/game_media_gog"):
+    """Download screenshots and videos"""
+    if not CFG['download_media']:
+        return game_data
+    
+    safe_title = sanitize(game_data.get("title", "game"))
+    media_dir = os.path.join(base_dir, safe_title)
+    
+    downloaded_images = []
+    downloaded_videos = []
+    
+    # Header
+    if game_data.get("header_image") and game_data["header_image"] != "N/A":
+        path = os.path.join(media_dir, "header.jpg")
+        if download_file(game_data["header_image"], path):
+            downloaded_images.append(path)
+    
+    # Screenshots
+    screenshots = game_data.get("screenshots", [])
+    if isinstance(screenshots, list):
+        for idx, url in enumerate(screenshots, 1):
+            path = os.path.join(media_dir, f"screenshot_{idx}.jpg")
+            if download_file(url, path):
+                downloaded_images.append(path)
+    
+    # Videos
+    videos = game_data.get("videos", [])
+    if isinstance(videos, list):
+        for idx, url in enumerate(videos, 1):
+            if url.lower().endswith('.mp4'):
+                path = os.path.join(media_dir, f"video_{idx}.mp4")
+                if download_file(url, path):
+                    downloaded_videos.append(path)
+    
+    game_data["downloaded_images"] = downloaded_images
+    game_data["downloaded_videos"] = downloaded_videos
+    
+    return game_data
+
+async def scrape(pages=11, workers=3, headless=True, download_media=True):
+    """Main scraping function"""
+    CFG['workers'] = workers
+    CFG['headless'] = headless
+    CFG['download_media'] = download_media
+    
+    log(f"🚀 GOG Scraper - Playwright Edition")
+    log(f"📊 Pages: {pages} (~{pages * 48} games)")
+    log(f"👷 Workers: {workers}")
+    log(f"💾 Download media: {'YES' if download_media else 'NO'}")
+    
+    start = time.time()
+    all_games = []
+    
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=headless)
+        context = await browser.new_context(
+            viewport={'width': 1920, 'height': 1080},
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        )
+        
+        # Distribute pages among workers
+        pages_per_worker = max(1, pages // workers)
+        tasks = []
+        
+        for i in range(workers):
+            start_page = i * pages_per_worker + 1
+            end_page = min(pages, start_page + pages_per_worker - 1) if i < workers - 1 else pages
+            if start_page > pages:
+                break
+            
+            worker_pages = list(range(start_page, end_page + 1))
+            tasks.append(worker(context, worker_pages, i + 1))
+        
+        # Run all workers
+        results = await asyncio.gather(*tasks)
+        
+        for result in results:
+            all_games.extend(result)
+        
+        await browser.close()
+    
+    elapsed = time.time() - start
+    
+    if not all_games:
+        log("❌ No games scraped")
+        return []
+    
+    # Create DataFrame
+    df = pd.DataFrame(all_games)
+    
+    # Dedupe
     if 'url' in df.columns:
-        initial_count = len(df)
+        before = len(df)
         df = df.drop_duplicates(subset=['url'], keep='first')
-        duplicates_removed = initial_count - len(df)
-    else:
-        duplicates_removed = 0
+        if before > len(df):
+            log(f"🗑️  Removed {before - len(df)} duplicates")
     
-    # Additional filter at DataFrame level (safety check)
-    before_filter = len(df)
-    df = df[df.apply(lambda row: has_media_content(
-        row.get("screenshots", "N/A"), 
-        row.get("videos", "N/A")
-    ), axis=1)]
-    after_filter = len(df)
-    dropped_count = before_filter - after_filter
+    # Convert lists to strings
+    for col in ['screenshots', 'videos', 'downloaded_images', 'downloaded_videos']:
+        if col in df.columns:
+            df[col] = df[col].apply(lambda x: ", ".join(x) if isinstance(x, list) else x)
     
+    # Save
     out_dir = Path("scraped_data")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_file = out_dir / "gog_games_detailed.csv"
+    out_dir.mkdir(exist_ok=True)
+    out_file = out_dir / "gog_games_playwright.csv"
     
-    # ensure some expected columns exist
-    req_cols = [
-        'title', 'release_date', 'original_price', 'price', 'discount_percentage',
-        'review_summary', 'url', 'platforms', 'genres', 'categories', 'multiplayer',
-        'singleplayer', 'developer', 'publisher', 'description',
-        'system_requirements_windows', 'system_requirements_mac', 'system_requirements_linux',
-        'header_image', 'screenshots', 'videos', 'downloaded_images', 'downloaded_videos'
-    ]
-    for c in req_cols:
-        if c not in df.columns:
-            df[c] = "N/A"
-    df = df[req_cols]
     df.to_csv(out_file, index=False, encoding='utf-8-sig')
     
-    # Print summary
-    print(f"\n{'='*70}")
-    print(f"✅ SCRAPING COMPLETE")
-    print(f"   Total games: {len(df)}")
-    print(f"   Duplicates removed: {duplicates_removed}")
-    if dropped_count > 0:
-        print(f"   🗑️  Dropped {dropped_count} games with no media content")
-    print(f"   Time: {elapsed:.1f}s")
-    print(f"   Speed: {len(df)/elapsed:.2f} games/sec")
-    print(f"💾 Saved CSV: {out_file}")
-    print(f"{'='*70}\n")
+    # Stats
+    log(f"\n{'='*60}")
+    log(f"✅ SUCCESS: {len(df)} games in {elapsed:.1f}s ({len(df)/elapsed:.2f} games/s)")
+    log(f"💾 Saved: {out_file}")
     
-    # Print statistics
-    if scrape_details:
-        print(f"📊 Statistics:")
-        
-        if 'developer' in df.columns:
-            dev_counts = df[df['developer'] != 'N/A']['developer'].value_counts()
-            if not dev_counts.empty:
-                print(f"   Top developer: {dev_counts.index[0]} ({dev_counts.iloc[0]} games)")
-        
-        if 'genres' in df.columns:
-            non_na_genres = df[df['genres'] != 'N/A']
-            print(f"   Games with genre info: {len(non_na_genres)}")
-        
-        if 'platforms' in df.columns:
-            non_na_platforms = df[df['platforms'] != 'N/A']
-            print(f"   Games with platform info: {len(non_na_platforms)}")
-        
-        if 'singleplayer' in df.columns:
-            sp_games = df[df['singleplayer'] == 'Yes']
-            print(f"   Single-player games: {len(sp_games)}")
-        
-        if 'multiplayer' in df.columns:
-            mp_games = df[df['multiplayer'] == 'Yes']
-            print(f"   Multi-player games: {len(mp_games)}")
-        
-        if download_media:
-            if 'screenshots' in df.columns:
-                games_with_screenshots = df[df['screenshots'] != 'N/A']
-                print(f"   Games with screenshots: {len(games_with_screenshots)}")
-            
-            if 'videos' in df.columns:
-                games_with_videos = df[df['videos'] != 'N/A']
-                print(f"   Games with videos: {len(games_with_videos)}")
-            
-            if 'downloaded_images' in df.columns:
-                total_images = sum(len(eval(str(x))) if isinstance(x, (str, list)) and str(x).startswith('[') else 0 for x in df['downloaded_images'])
-                print(f"   Images downloaded: {total_images}")
-            
-            if 'downloaded_videos' in df.columns:
-                total_videos = sum(len(eval(str(x))) if isinstance(x, (str, list)) and str(x).startswith('[') else 0 for x in df['downloaded_videos'])
-                print(f"   🎬 Videos downloaded: {total_videos}")
+    with_genres = len(df[df['genres'] != 'N/A'])
+    with_platforms = len(df[df['platforms'] != 'N/A'])
+    with_dev = len(df[df['developer'] != 'N/A'])
+    with_screenshots = len(df[df['screenshots'].str.len() > 10])
+    with_videos = len(df[df['videos'].str.len() > 10])
+    
+    log(f"\n📈 Data Quality:")
+    log(f"   Genres: {with_genres}/{len(df)} ({100*with_genres/len(df):.1f}%)")
+    log(f"   Platforms: {with_platforms}/{len(df)} ({100*with_platforms/len(df):.1f}%)")
+    log(f"   Developer: {with_dev}/{len(df)} ({100*with_dev/len(df):.1f}%)")
+    log(f"   Screenshots: {with_screenshots}/{len(df)} ({100*with_screenshots/len(df):.1f}%)")
+    log(f"   Videos: {with_videos}/{len(df)} ({100*with_videos/len(df):.1f}%)")
+    
+    log(f"{'='*60}\n")
+    
+    # Sample
+    if len(df) > 0:
+        print("\n📋 Sample:")
+        print(df[['title', 'genres', 'platforms', 'developer']].head(5).to_string(index=False))
     
     return df.to_dict(orient='records')
 
-# -----------------------
-# CLI
-# -----------------------
-
+def main():
+    import argparse
+    p = argparse.ArgumentParser(description="GOG Scraper - Playwright")
+    p.add_argument("--pages", type=int, default=11, help="Pages to scrape")
+    p.add_argument("--workers", type=int, default=3, help="Concurrent workers")
+    p.add_argument("--no-headless", action="store_true", help="Show browser")
+    p.add_argument("--no-media", action="store_true", help="Skip media download")
+    args = p.parse_args()
+    
+    asyncio.run(scrape(
+        pages=args.pages,
+        workers=args.workers,
+        headless=not args.no_headless,
+        download_media=not args.no_media
+    ))
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="GOG scraper - downloads media (header, screenshots, mp4)")
-    parser.add_argument("--max-games", type=int, default=DEFAULT_MAX_GAMES, help="Maximum number of games to attempt")
-    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Number of concurrent page workers")
-    parser.add_argument("--headless", action="store_true", default=DEFAULT_HEADLESS, help="Run browser headless")
-    parser.add_argument("--no-media", action="store_true", help="Do not download media (images/videos)")
-    parser.add_argument("--no-details", action="store_true", help="Do not visit individual game detail pages")
-    parser.add_argument("--debug", action="store_true", help="Run in non-headless mode and verbose")
-    args = parser.parse_args()
+    main()
 
-    headless = False
-
-    start = time.perf_counter()
-    scrape_gog_games(max_games=50, num_workers=15, headless=True, scrape_details=True, download_media=True)
-    end = time.perf_counter()
-    print(f"Total execution time: {end - start:.4f} seconds")
+#python gog_scraper.py --pages 15 --workers 4

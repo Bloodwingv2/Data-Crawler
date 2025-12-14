@@ -327,7 +327,7 @@ def scrape_game_details(driver, game_url, game_title, download_media_files=True)
         if download_media_files:
             safe_title = re.sub(r'[<>:"/\\|?*]', '', game_title)[:50]
             script_dir = os.path.dirname(os.path.abspath(__file__))
-            game_media_dir = os.path.join(script_dir, "scraped_data", "game_media", safe_title)
+            game_media_dir = os.path.join(script_dir, "scraped_data", "steam_media", safe_title)
             os.makedirs(game_media_dir, exist_ok=True)
             
             # Header Image
