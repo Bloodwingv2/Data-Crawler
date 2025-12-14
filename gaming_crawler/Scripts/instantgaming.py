@@ -1,402 +1,465 @@
 import pandas as pd
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-import time
-import os
-import requests
-import re
-from threading import Lock
+from playwright.sync_api import sync_playwright
+import time, os, requests, re, sys, argparse
+from datetime import datetime
 
-data_lock = Lock()
-all_game_data = []
+# Force UTF-8 encoding
+if sys.platform.startswith('win'):
+    import codecs
+    sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
+    sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'strict')
 
 def download_media(url, save_dir, filename):
-    """Download images from URLs."""
+    """Download images and videos from URLs."""
     if not url or url == "N/A" or not url.startswith('http'): 
         return None
-        
     try:
-        response = requests.get(url, timeout=15, stream=True, headers={
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
-        
-        if response.status_code == 200:
+        r = requests.get(url, timeout=15, stream=True, headers={'User-Agent': 'Mozilla/5.0'})
+        if r.status_code == 200:
             filepath = os.path.join(save_dir, filename)
             with open(filepath, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            print(f"      ✓ Downloaded: {filename}")
+                for chunk in r.iter_content(8192): f.write(chunk)
+            print(f"      ✓ {filename}")
             return filepath
-        else:
-            print(f"      ✗ Failed ({response.status_code}): {filename}")
     except Exception as e:
-        print(f"      ✗ Error: {str(e)[:40]}")
+        print(f"      ✗ {filename}: {str(e)[:30]}")
     return None
 
-def scrape_game_details(driver, game_url, game_title, download_media_files=True):
-    """Scrape game details from Instant Gaming with EXACT selectors."""
+def safe_text(text):
+    """Clean text for CSV"""
+    if not text or text == "N/A":
+        return "N/A"
+    return text.replace('\n', ' ').replace('\r', '').replace('\t', ' ').strip()
+
+def scrape_game_details(page, game_url, game_title, download_media_files=True):
+    """Scrape ALL game details from Instant Gaming using exact HTML structure."""
     details = {
-        "title": game_title,
-        "url": game_url,
-        "developer": "N/A",
-        "publisher": "N/A",
-        "platforms": "N/A",
-        "genre": "N/A",
-        "release_date": "N/A",
-        "languages": "N/A",
-        "description": "N/A",
-        "video_url": "N/A",
-        "header_image": "N/A",
-        "screenshots": [],
-        "downloaded_images": [],
+        "title": game_title, "url": game_url, "developer": "N/A", "publisher": "N/A",
+        "platforms": "N/A", "genre": "N/A", "release_date": "N/A", "description": "N/A",
+        "current_price": "N/A", "original_price": "N/A", "discount_percentage": "N/A",
+        "currency": "N/A", "stock_status": "N/A", "ig_rating": "N/A", "review_count": "N/A",
+        "steam_recent_reviews": "N/A", "steam_all_reviews": "N/A", "steam_review_count": "N/A",
+        "video_url": "N/A", "header_image": "N/A", "screenshots": [], "user_tags": [],
+        "game_features": [], "system_requirements_min": "N/A", "system_requirements_rec": "N/A",
+        "product_id": "N/A", "editions": [], "scrape_timestamp": datetime.now().isoformat()
     }
     
     try:
-        print(f"\n{'='*70}")
-        print(f"SCRAPING: {game_title}")
-        print(f"{'='*70}")
+        print(f"\n{'='*70}\nSCRAPING: {game_title}\n{'='*70}")
         
-        driver.get(game_url)
-        time.sleep(3)
+        page.goto(game_url, wait_until="load", timeout=60000)
+        page.wait_for_timeout(3000)
+        print("✓ Page loaded")
         
-        # Create media directory
         safe_title = re.sub(r'[<>:"/\\|?*]', '', game_title)[:50].strip()
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        game_media_dir = os.path.join(script_dir, "scraped_data", "instant_gaming_media", safe_title)
+        game_media_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
+                                      "scraped_data", "instant_gaming_media", safe_title)
         os.makedirs(game_media_dir, exist_ok=True)
         
-        # --- DEVELOPER (From meta tag: itemprop="author") ---
-        print("\n[1] DEVELOPER:")
+        # Product ID from URL
+        id_match = re.search(r'/(\d+)-', game_url)
+        if id_match: 
+            details["product_id"] = id_match.group(1)
+        
+        # === PRICING ===
+        print("\n[PRICING]")
         try:
-            dev_meta = driver.find_element(By.CSS_SELECTOR, 'meta[itemprop="author"]')
-            details["developer"] = dev_meta.get_attribute("content")
-            print(f"   ✓ Found: {details['developer']}")
-        except:
-            # Fallback: Look in table with th "Entwickler:" or "Developer:"
+            # Current price from .total
+            price_elem = page.locator(".amount .total").first
+            if price_elem.count() > 0:
+                details["current_price"] = safe_text(price_elem.inner_text())
+                # Extract currency
+                currency_match = re.search(r'[€$£¥₹₽]', details["current_price"])
+                if currency_match: 
+                    details["currency"] = currency_match.group()
+        except: pass
+        
+        try:
+            # Original/Retail price from .discounts .retail
+            retail_elem = page.locator(".amount .discounts .retail").first
+            if retail_elem.count() > 0:
+                details["original_price"] = safe_text(retail_elem.inner_text())
+        except: pass
+        
+        try:
+            # Discount percentage from .discounted
+            discount_elem = page.locator(".amount .discounted").first
+            if discount_elem.count() > 0:
+                details["discount_percentage"] = safe_text(discount_elem.inner_text())
+        except: pass
+        
+        try:
+            # Stock status from .stock span
+            stock_elem = page.locator(".stock span").first
+            if stock_elem.count() > 0:
+                details["stock_status"] = safe_text(stock_elem.inner_text())
+        except: pass
+        
+        print(f"   ✓ Price: {details['current_price']} (was {details['original_price']}) {details['discount_percentage']}")
+        
+        # === GAME INFO FROM META TAGS ===
+        print("\n[GAME INFO]")
+        try:
+            dev_meta = page.locator('meta[itemprop="author"]').first
+            if dev_meta.count() > 0:
+                details["developer"] = safe_text(dev_meta.get_attribute("content"))
+        except: pass
+        
+        try:
+            pub_meta = page.locator('meta[itemprop="publisher"]').first
+            if pub_meta.count() > 0:
+                details["publisher"] = safe_text(pub_meta.get_attribute("content"))
+        except: pass
+        
+        try:
+            platform_meta = page.locator('meta[itemprop="gamePlatform"]').first
+            if platform_meta.count() > 0:
+                details["platforms"] = safe_text(platform_meta.get_attribute("content"))
+        except: pass
+        
+        # === GAME INFO FROM TABLE ===
+        try:
+            # Genre from tr.genres
+            genre_row = page.locator("tr.genres a.tag").first
+            if genre_row.count() > 0:
+                details["genre"] = safe_text(genre_row.inner_text())
+        except: pass
+        
+        try:
+            # Release date from tr.release-date
+            date_row = page.locator("tr.release-date th:nth-child(2)").first
+            if date_row.count() > 0:
+                details["release_date"] = safe_text(date_row.inner_text())
+        except: pass
+        
+        # === DESCRIPTION ===
+        try:
+            desc_elem = page.locator("span[itemprop='description']").first
+            if desc_elem.count() > 0:
+                desc = desc_elem.inner_text().strip()
+                details["description"] = safe_text(desc[:1000])  # Limit to 1000 chars
+        except: pass
+        
+        # Fallback description from .product-text .text
+        if details["description"] == "N/A":
             try:
-                dev_row = driver.find_element(By.XPATH, "//th[contains(text(), 'Developer') or contains(text(), 'Entwickler')]/following-sibling::th")
-                dev_link = dev_row.find_element(By.TAG_NAME, "a")
-                details["developer"] = dev_link.text.strip()
-                print(f"   ✓ Found (table): {details['developer']}")
-            except:
-                print("   ✗ NOT FOUND")
+                desc_elem = page.locator(".product-text .text").first
+                if desc_elem.count() > 0:
+                    desc = desc_elem.inner_text().strip()
+                    details["description"] = safe_text(desc[:1000])
+            except: pass
         
-        # --- PUBLISHER (From meta tag: itemprop="publisher") ---
-        print("\n[2] PUBLISHER:")
-        try:
-            pub_meta = driver.find_element(By.CSS_SELECTOR, 'meta[itemprop="publisher"]')
-            details["publisher"] = pub_meta.get_attribute("content")
-            print(f"   ✓ Found: {details['publisher']}")
-        except:
-            # Fallback: Look in table with th "Herausgeber:" or "Editor:"
-            try:
-                pub_row = driver.find_element(By.XPATH, "//th[contains(text(), 'Editor') or contains(text(), 'Herausgeber') or contains(text(), 'Publisher')]/following-sibling::th")
-                pub_link = pub_row.find_element(By.TAG_NAME, "a")
-                details["publisher"] = pub_link.text.strip()
-                print(f"   ✓ Found (table): {details['publisher']}")
-            except:
-                print("   ✗ NOT FOUND")
+        print(f"   ✓ {details['developer']} | {details['publisher']} | {details['genre']}")
+        print(f"   ✓ Release: {details['release_date']} | Platform: {details['platforms']}")
         
-        # --- GENRE (From table row with class="genres") ---
-        print("\n[3] GENRE:")
+        # === RATINGS & REVIEWS ===
+        print("\n[RATINGS]")
         try:
-            genre_row = driver.find_element(By.CSS_SELECTOR, "tr.genres th:nth-child(2)")
-            genre_link = genre_row.find_element(By.TAG_NAME, "a")
-            details["genre"] = genre_link.text.strip()
-            print(f"   ✓ Found: {details['genre']}")
-        except:
-            print("   ✗ NOT FOUND")
+            # IG Rating from .ig-search-reviews-avg
+            rating_elem = page.locator(".ig-search-reviews-avg").first
+            if rating_elem.count() > 0:
+                details["ig_rating"] = safe_text(rating_elem.inner_text())
+        except: pass
         
-        # --- RELEASE DATE (From table row with class="release-date") ---
-        print("\n[4] RELEASE DATE:")
         try:
-            date_row = driver.find_element(By.CSS_SELECTOR, "tr.release-date th:nth-child(2)")
-            details["release_date"] = date_row.text.strip()
-            print(f"   ✓ Found: {details['release_date']}")
-        except:
-            print("   ✗ NOT FOUND")
+            # Review count from .based .link
+            review_count_elem = page.locator(".based .link").first
+            if review_count_elem.count() > 0:
+                details["review_count"] = safe_text(review_count_elem.inner_text())
+        except: pass
         
-        # --- PLATFORMS (From meta tag: data-platform) ---
-        print("\n[5] PLATFORMS:")
         try:
-            platform_meta = driver.find_element(By.CSS_SELECTOR, 'meta[itemprop="category"]')
-            platform = platform_meta.get_attribute("data-platform")
-            details["platforms"] = platform if platform else "N/A"
-            print(f"   ✓ Found: {details['platforms']}")
-        except:
-            # Fallback: check platform container
-            try:
-                platform_elem = driver.find_element(By.CSS_SELECTOR, ".platform-container span")
-                details["platforms"] = platform_elem.text.strip()
-                print(f"   ✓ Found (span): {details['platforms']}")
-            except:
-                print("   ✗ NOT FOUND")
+            # Steam recent reviews
+            steam_recent = page.locator("tr:has-text('Recent Steam reviews') th:nth-child(2)").first
+            if steam_recent.count() > 0:
+                details["steam_recent_reviews"] = safe_text(steam_recent.inner_text())
+        except: pass
         
-        # --- DESCRIPTION (From span[itemprop='description']) ---
-        print("\n[6] DESCRIPTION:")
         try:
-            desc_elem = driver.find_element(By.CSS_SELECTOR, "span[itemprop='description']")
-            desc = desc_elem.text.strip()
-            details["description"] = desc[:500] if desc else "N/A"
-            print(f"   ✓ Found: {len(desc)} chars")
-        except:
-            print("   ✗ NOT FOUND")
-        
-        # --- HEADER IMAGE (From meta itemprop="image") ---
-        print("\n[7] HEADER/COVER IMAGE:")
-        try:
-            img_meta = driver.find_element(By.CSS_SELECTOR, 'meta[itemprop="image"]')
-            img_url = img_meta.get_attribute("content")
-            details["header_image"] = img_url
-            print(f"   ✓ Found: {img_url[:60]}...")
-            
-            if download_media_files:
-                download_media(img_url, game_media_dir, "cover.jpg")
-        except:
-            print("   ✗ NOT FOUND")
-        
-        # --- VIDEO (From iframe with id="ig-vimeo-player") ---
-        print("\n[8] VIDEO:")
-        try:
-            video_iframe = driver.find_element(By.CSS_SELECTOR, "#ig-vimeo-player")
-            video_src = video_iframe.get_attribute("src")
-            details["video_url"] = video_src
-            print(f"   ✓ Found: {video_src[:60]}...")
-        except:
-            print("   ✗ NOT FOUND")
-        
-        # --- SCREENSHOTS (From .screenshots a[itemprop='screenshot']) ---
-        print("\n[9] SCREENSHOTS:")
-        screenshot_urls = []
-        try:
-            # Find all screenshot links
-            screenshot_links = driver.find_elements(By.CSS_SELECTOR, ".screenshots a[itemprop='screenshot']")
-            
-            if screenshot_links:
-                print(f"   Found {len(screenshot_links)} screenshots")
+            # Steam all reviews with count
+            steam_all_elem = page.locator("tr:has-text('All Steam reviews') th:nth-child(2) span").first
+            if steam_all_elem.count() > 0:
+                details["steam_all_reviews"] = safe_text(steam_all_elem.inner_text())
                 
-                for idx, link in enumerate(screenshot_links[:10]):  # Limit to 10
-                    try:
-                        # Get high-res URL from href attribute
-                        href = link.get_attribute("href")
-                        
-                        if href and any(ext in href.lower() for ext in ['.jpg', '.png', '.jpeg']):
-                            screenshot_urls.append(href)
-                            print(f"      [{idx+1}] {href[:50]}...")
-                            
-                            if download_media_files:
-                                ext = "jpg"
-                                if ".png" in href.lower():
-                                    ext = "png"
-                                
-                                downloaded = download_media(
-                                    href,
-                                    game_media_dir,
-                                    f"screenshot_{idx+1}.{ext}"
-                                )
-                                if downloaded:
-                                    details["downloaded_images"].append(downloaded)
-                    except Exception as e:
-                        print(f"      ✗ Screenshot {idx+1} error: {e}")
-                        continue
-        except Exception as e:
-            print(f"   ✗ Error: {e}")
+            # Steam review count
+            steam_count = page.locator("tr:has-text('All Steam reviews') th:nth-child(2) span:nth-child(2)").first
+            if steam_count.count() > 0:
+                count_text = steam_count.inner_text()
+                # Extract number from parentheses
+                count_match = re.search(r'\((\d+)\)', count_text)
+                if count_match:
+                    details["steam_review_count"] = count_match.group(1)
+        except: pass
         
-        if screenshot_urls:
-            details["screenshots"] = screenshot_urls
-            print(f"   ✓ Total: {len(screenshot_urls)} screenshots")
-        else:
-            print("   ✗ NOT FOUND")
+        print(f"   ✓ IG Rating: {details['ig_rating']} | Reviews: {details['review_count']}")
+        print(f"   ✓ Steam: {details['steam_all_reviews']} ({details['steam_review_count']})")
         
-        # Save debug HTML if needed
-        if details["developer"] == "N/A" or details["publisher"] == "N/A":
-            debug_file = os.path.join(game_media_dir, "page_source.html")
-            with open(debug_file, 'w', encoding='utf-8') as f:
-                f.write(driver.page_source)
-            print(f"\n⚠ Debug HTML saved: {debug_file}")
+        # === USER TAGS ===
+        print("\n[TAGS & FEATURES]")
+        try:
+            tag_links = page.locator(".users-tags a.searchtag").all()
+            tags = []
+            for tag in tag_links[:20]:  # Limit to 20 tags
+                tag_text = tag.inner_text().strip()
+                if tag_text and tag_text != "...":
+                    tags.append(tag_text)
+            details["user_tags"] = tags
+            if tags:
+                print(f"   ✓ User Tags: {len(tags)} found")
+        except: pass
         
-        # Print summary
-        print(f"\n{'='*70}")
-        print(f"SUMMARY: {game_title}")
-        print(f"  Developer: {details['developer']}")
-        print(f"  Publisher: {details['publisher']}")
-        print(f"  Genre: {details['genre']}")
-        print(f"  Release: {details['release_date']}")
-        print(f"  Platform: {details['platforms']}")
-        print(f"  Images: {len(details['downloaded_images'])} downloaded")
-        print(f"{'='*70}\n")
+        # === GAME FEATURES ===
+        try:
+            feature_links = page.locator(".features-listing a.feature .feature-text").all()
+            features = []
+            for feat in feature_links:
+                feat_text = feat.inner_text().strip()
+                if feat_text:
+                    features.append(feat_text)
+            details["game_features"] = features
+            if features:
+                print(f"   ✓ Game Features: {len(features)} found")
+        except: pass
+        
+        # === SYSTEM REQUIREMENTS ===
+        print("\n[SYSTEM REQUIREMENTS]")
+        try:
+            # Minimum requirements
+            min_items = page.locator(".minimal ul.specs li").all()
+            min_reqs = []
+            for item in min_items:
+                min_reqs.append(safe_text(item.inner_text()))
+            if min_reqs:
+                details["system_requirements_min"] = " | ".join(min_reqs)
+                print(f"   ✓ Min Requirements: {len(min_reqs)} items")
+        except: pass
+        
+        try:
+            # Recommended requirements
+            rec_items = page.locator(".recommended ul.specs li").all()
+            rec_reqs = []
+            for item in rec_items:
+                rec_reqs.append(safe_text(item.inner_text()))
+            if rec_reqs:
+                details["system_requirements_rec"] = " | ".join(rec_reqs)
+                print(f"   ✓ Rec Requirements: {len(rec_reqs)} items")
+        except: pass
+        
+        # === EDITIONS ===
+        try:
+            edition_items = page.locator(".editions .item").all()
+            editions = []
+            for edition in edition_items[:5]:  # Limit to 5 editions
+                try:
+                    name_elem = edition.locator(".name h3").first
+                    price_elem = edition.locator(".amount .total").first
+                    
+                    if name_elem.count() > 0 and price_elem.count() > 0:
+                        edition_name = safe_text(name_elem.inner_text())
+                        edition_price = safe_text(price_elem.inner_text())
+                        editions.append(f"{edition_name}: {edition_price}")
+                except: continue
+            
+            if editions:
+                details["editions"] = editions
+                print(f"   ✓ Editions: {len(editions)} found")
+        except: pass
+        
+        # === MEDIA ===
+        print("\n[MEDIA]")
+        
+        # Header image from meta
+        try:
+            img_meta = page.locator('meta[itemprop="image"]').first
+            if img_meta.count() > 0:
+                details["header_image"] = img_meta.get_attribute("content")
+                if download_media_files and details["header_image"] != "N/A":
+                    dl = download_media(details["header_image"], game_media_dir, "cover.jpg")
+        except: pass
+        
+        # Video from iframe
+        try:
+            video_iframe = page.locator("#ig-vimeo-player").first
+            if video_iframe.count() > 0:
+                details["video_url"] = video_iframe.get_attribute("src")
+                print(f"   ✓ Video: Found")
+        except: pass
+        
+        # Screenshots
+        try:
+            screenshot_links = page.locator(".screenshots a[itemprop='screenshot']").all()
+            screenshots = []
+            
+            for idx, link in enumerate(screenshot_links[:10]):
+                try:
+                    href = link.get_attribute("href")
+                    if href:
+                        screenshots.append(href)
+                        if download_media_files:
+                            ext = "jpg"
+                            if ".png" in href.lower(): ext = "png"
+                            elif ".webp" in href.lower(): ext = "webp"
+                            download_media(href, game_media_dir, f"screenshot_{idx+1}.{ext}")
+                except: continue
+            
+            details["screenshots"] = screenshots
+            if screenshots:
+                print(f"   ✓ Screenshots: {len(screenshots)} found")
+        except: pass
+        
+        print(f"\n{'='*70}\n✓ COMPLETE: {game_title}\n{'='*70}\n")
         
     except Exception as e:
-        print(f"\n✗✗✗ CRITICAL ERROR: {e}")
+        print(f"\n✗✗✗ ERROR: {e}")
         import traceback
         traceback.print_exc()
     
     return details
 
-def scrape_products_from_page(driver, base_url, max_games):
-    """Scrape game listings from Instant Gaming homepage."""
-    print(f"\n{'#'*70}")
-    print(f"LOADING INSTANT GAMING HOMEPAGE")
-    print(f"{'#'*70}\n")
-    
-    driver.get(base_url)
-    time.sleep(5)
-    
-    # Scroll to load more games
-    print("Scrolling to load games...")
-    for i in range(5):
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(2)
-        print(f"  Scroll {i+1}/5")
-    
-    print("\nExtracting game links...")
-    
-    game_links = []
+def scrape_products_from_page(page, base_url, max_games):
+    """Scrape game listings from homepage."""
+    print(f"\n{'#'*70}\nLOADING HOMEPAGE\n{'#'*70}\n")
     
     try:
-        # Find all game items
-        game_items = driver.find_elements(By.CSS_SELECTOR, ".listing-items article.item")
+        page.goto(base_url, wait_until="load", timeout=60000)
+        page.wait_for_timeout(5000)
+        print("✓ Page loaded")
         
-        print(f"  Found {len(game_items)} game items")
+        # Scroll to load more
+        for i in range(5):
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(2000)
         
-        for item in game_items[:max_games]:
+        game_links = []
+        
+        # Get all game items
+        items = page.locator(".listing-items article.item").all()
+        print(f"✓ Found {len(items)} game items")
+        
+        for idx, item in enumerate(items[:max_games]):
             try:
-                # Get the link
-                link = item.find_element(By.CSS_SELECTOR, "a.cover")
+                link = item.locator("a.cover").first
+                if link.count() == 0: continue
+                
                 href = link.get_attribute("href")
                 
-                # Get the title
-                try:
-                    title_elem = item.find_element(By.CSS_SELECTOR, ".name .title")
-                    title = title_elem.get_attribute("title") or title_elem.text.strip()
-                except:
-                    title = "Unknown"
+                # Get title
+                title_elem = item.locator(".name .title").first
+                title = "Unknown"
+                if title_elem.count() > 0:
+                    title = title_elem.get_attribute("title") or title_elem.inner_text().strip()
                 
-                if href and "instant-gaming.com" in href:
-                    game_links.append({"url": href, "title": title})
+                if href:
+                    if href.startswith("/"):
+                        href = f"https://www.instant-gaming.com{href}"
                     
-            except Exception as e:
-                print(f"  ✗ Error extracting item: {e}")
-                continue
-    
+                    game_links.append({"url": href, "title": title})
+                    print(f"  [{idx+1}] ✓ {title[:60]}")
+            except: continue
+        
+        # Remove duplicates
+        unique = []
+        seen = set()
+        for g in game_links:
+            if g["url"] not in seen:
+                seen.add(g["url"])
+                unique.append(g)
+        
+        print(f"\n✓ Extracted {len(unique)} unique games\n")
+        return unique[:max_games]
+        
     except Exception as e:
-        print(f"✗ Error finding game items: {e}")
-    
-    # Remove duplicates
-    unique_games = []
-    seen_urls = set()
-    for game in game_links:
-        if game["url"] not in seen_urls:
-            seen_urls.add(game["url"])
-            unique_games.append(game)
-    
-    print(f"\n✓ Found {len(unique_games)} unique games")
-    return unique_games[:max_games]
-
-def create_driver(headless):
-    """Create Chrome driver."""
-    options = webdriver.ChromeOptions()
-    if headless:
-        options.add_argument('--headless')
-    options.add_argument('--no-sandbox')
-    options.add_argument('--disable-dev-shm-usage')
-    options.add_argument('--disable-blink-features=AutomationControlled')
-    options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
-    
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-    return driver
+        print(f"\n✗✗✗ ERROR: {e}")
+        return []
 
 def run_scraper(base_url, max_games, download_media, headless):
-    """
-    Main scraper function.
-    
-    Args:
-        base_url (str): URL of the Instant Gaming page to scrape
-        max_games (int): Maximum number of games to scrape
-        download_media (bool): Whether to download images and media
-        headless (bool): Whether to run browser in headless mode
-    
-    Returns:
-        pd.DataFrame: DataFrame containing scraped game data
-    """
+    """Main scraper function."""
     print("\n" + "="*70)
-    print("INSTANT GAMING SCRAPER")
-    print("="*70 + "\n")
-    print(f"Configuration:")
-    print(f"  Base URL: {base_url}")
-    print(f"  Max Games: {max_games}")
-    print(f"  Download Media: {download_media}")
-    print(f"  Headless Mode: {headless}")
+    print("INSTANT GAMING SCRAPER - OPTIMIZED")
     print("="*70 + "\n")
     
-    # Create driver
-    driver = create_driver(headless=headless)
+    os.makedirs("scraped_data", exist_ok=True)
     
-    try:
-        # Step 1: Get game list from homepage
-        games = scrape_products_from_page(driver, base_url, max_games)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
+        ctx = browser.new_context(
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            viewport={'width': 1920, 'height': 1080}
+        )
+        page = ctx.new_page()
         
-        if not games:
-            print("✗ No games found! Check selectors.")
-            return None
-        
-        # Step 2: Scrape each game
-        all_results = []
-        
-        for idx, game in enumerate(games, 1):
-            print(f"\n\n[{idx}/{len(games)}] Processing: {game['title']}")
+        try:
+            games = scrape_products_from_page(page, base_url, max_games)
+            if not games:
+                return None
             
-            details = scrape_game_details(
-                driver,
-                game['url'],
-                game['title'],
-                download_media_files=download_media
-            )
+            all_results = []
+            for idx, game in enumerate(games, 1):
+                print(f"\n[{idx}/{len(games)}] {game['title']}")
+                details = scrape_game_details(page, game['url'], game['title'], download_media)
+                all_results.append(details)
+                time.sleep(2)
             
-            all_results.append(details)
+            # Convert to DataFrame
+            df = pd.DataFrame(all_results)
             
-            # Small delay between requests
-            time.sleep(2)
+            # Convert lists to pipe-separated strings
+            for col in ['screenshots', 'user_tags', 'game_features', 'editions']:
+                if col in df.columns:
+                    df[col] = df[col].apply(lambda x: '|'.join(x) if isinstance(x, list) and x else 'N/A')
+            
+            # Save CSV with UTF-8
+            df.to_csv("scraped_data/instant_gaming_data.csv", index=False, encoding='utf-8-sig')
         
-        # Final save
-        df = pd.DataFrame(all_results)
-        df.to_csv("scraped_data/instant_gaming_data.csv", index=False, encoding='utf-8')
-        
-        print("\n" + "="*70)
-        print("SCRAPING COMPLETE!")
-        print(f"Total games scraped: {len(all_results)}")
-        print(f"Results saved to: scraped_data/instant_gaming_data.csv")
-        print("="*70)
-        
-        return df
-    
-    except Exception as e:
-        print(f"\n✗✗✗ FATAL ERROR: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
-    
-    finally:
-        driver.quit()
-        print("\nBrowser closed.")
+            
+            print("\n" + "="*70)
+            print(f"✓ COMPLETE! {len(all_results)} games scraped")
+            print("  CSV: scraped_data/instant_gaming_data.csv")
+            print("="*70 + "\n")
+            
+            # Show stats
+            print("DATA QUALITY:")
+            for col in ['current_price', 'developer', 'genre', 'description', 'ig_rating']:
+                if col in df.columns:
+                    non_na = len(df[df[col] != 'N/A'])
+                    print(f"  {col}: {non_na}/{len(df)} ({non_na/len(df)*100:.1f}%)")
+            
+            return df
+            
+        finally:
+            ctx.close()
+            browser.close()
 
-
-# --- MAIN EXECUTION ---
 if __name__ == "__main__":
-    # Configuration variables
-    INSTANT_GAMING_URL = "https://www.instant-gaming.com/de/"
-    MAX_GAMES = 20
-    DOWNLOAD_MEDIA = True
-    HEADLESS_MODE = True
+    parser = argparse.ArgumentParser(description='Instant Gaming Scraper - Optimized')
+    parser.add_argument('--url', type=str, default='https://www.instant-gaming.com/en/', 
+                       help='URL to scrape')
+    parser.add_argument('--max-games', type=int, default=20, help='Max games to scrape')
+    parser.add_argument('--no-media', action='store_true', help='Skip downloading media')
+    parser.add_argument('--headless', action='store_true', help='Run headless (default: False)')
     
-    # Run the scraper
-    results_df = run_scraper(
-        base_url=INSTANT_GAMING_URL,
-        max_games=MAX_GAMES,
-        download_media=DOWNLOAD_MEDIA,
-        headless=HEADLESS_MODE
-    )
+    args = parser.parse_args()
+    
+    print(f"\n{'='*70}\nCONFIGURATION\n{'='*70}")
+    print(f"URL: {args.url}")
+    print(f"Max Games: {args.max_games}")
+    print(f"Download Media: {not args.no_media}")
+    print(f"Headless: {args.headless}")
+    print("="*70 + "\n")
+    
+    df = run_scraper(args.url, args.max_games, not args.no_media, args.headless)
+    
+    if df is not None:
+        print("\nSAMPLE DATA (first 3 rows):")
+        print("="*70)
+        cols = ['title', 'current_price', 'discount_percentage', 'genre', 'ig_rating']
+        print(df[cols].head(3).to_string(index=False))
+        
+# Default: 20 games, with media
+# python scraper.py
+
+# Headless mode, 50 games, no media
+# python scraper.py --headless --max-games 50 --no-media
+
+# Custom URL
+# python scraper.py --url "https://www.instant-gaming.com/en/search/?type=software"
