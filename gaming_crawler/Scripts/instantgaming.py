@@ -1,13 +1,17 @@
 import pandas as pd
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright
+import asyncio
 import time, os, requests, re, sys, argparse
 from datetime import datetime
 
-# Force UTF-8 encoding
+# Force UTF-8 encoding and disable buffering
 if sys.platform.startswith('win'):
     import codecs
     sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
     sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'strict')
+
+# Force unbuffered output
+sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, 'reconfigure') else None
 
 def download_media(url, save_dir, filename):
     """Download images and videos from URLs."""
@@ -19,10 +23,8 @@ def download_media(url, save_dir, filename):
             filepath = os.path.join(save_dir, filename)
             with open(filepath, 'wb') as f:
                 for chunk in r.iter_content(8192): f.write(chunk)
-            print(f"      ✓ {filename}")
             return filepath
-    except Exception as e:
-        print(f"      ✗ {filename}: {str(e)[:30]}")
+    except: pass
     return None
 
 def safe_text(text):
@@ -31,8 +33,8 @@ def safe_text(text):
         return "N/A"
     return text.replace('\n', ' ').replace('\r', '').replace('\t', ' ').strip()
 
-def scrape_game_details(page, game_url, game_title, download_media_files=True):
-    """Scrape ALL game details from Instant Gaming using exact HTML structure."""
+async def scrape_game_details(page, game_url, game_title, download_media_files=True):
+    """Scrape game details - async version"""
     details = {
         "title": game_title, "url": game_url, "developer": "N/A", "publisher": "N/A",
         "platforms": "N/A", "genre": "N/A", "release_date": "N/A", "description": "N/A",
@@ -45,254 +47,206 @@ def scrape_game_details(page, game_url, game_title, download_media_files=True):
     }
     
     try:
-        print(f"\n{'='*70}\nSCRAPING: {game_title}\n{'='*70}")
-        
-        page.goto(game_url, wait_until="load", timeout=60000)
-        page.wait_for_timeout(3000)
-        print("✓ Page loaded")
+        await page.goto(game_url, wait_until="load", timeout=60000)
+        await page.wait_for_timeout(2000)
         
         safe_title = re.sub(r'[<>:"/\\|?*]', '', game_title)[:50].strip()
         game_media_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
                                       "scraped_data", "instant_gaming_media", safe_title)
         os.makedirs(game_media_dir, exist_ok=True)
         
-        # Product ID from URL
+        # Product ID
         id_match = re.search(r'/(\d+)-', game_url)
-        if id_match: 
-            details["product_id"] = id_match.group(1)
+        if id_match: details["product_id"] = id_match.group(1)
         
-        # === PRICING ===
-        print("\n[PRICING]")
+        # PRICING
         try:
-            # Current price from .total
             price_elem = page.locator(".amount .total").first
-            if price_elem.count() > 0:
-                details["current_price"] = safe_text(price_elem.inner_text())
-                # Extract currency
+            if await price_elem.count() > 0:
+                details["current_price"] = safe_text(await price_elem.inner_text())
                 currency_match = re.search(r'[€$£¥₹₽]', details["current_price"])
-                if currency_match: 
-                    details["currency"] = currency_match.group()
+                if currency_match: details["currency"] = currency_match.group()
         except: pass
         
         try:
-            # Original/Retail price from .discounts .retail
             retail_elem = page.locator(".amount .discounts .retail").first
-            if retail_elem.count() > 0:
-                details["original_price"] = safe_text(retail_elem.inner_text())
+            if await retail_elem.count() > 0:
+                details["original_price"] = safe_text(await retail_elem.inner_text())
         except: pass
         
         try:
-            # Discount percentage from .discounted
             discount_elem = page.locator(".amount .discounted").first
-            if discount_elem.count() > 0:
-                details["discount_percentage"] = safe_text(discount_elem.inner_text())
+            if await discount_elem.count() > 0:
+                details["discount_percentage"] = safe_text(await discount_elem.inner_text())
         except: pass
         
         try:
-            # Stock status from .stock span
             stock_elem = page.locator(".stock span").first
-            if stock_elem.count() > 0:
-                details["stock_status"] = safe_text(stock_elem.inner_text())
+            if await stock_elem.count() > 0:
+                details["stock_status"] = safe_text(await stock_elem.inner_text())
         except: pass
         
-        print(f"   ✓ Price: {details['current_price']} (was {details['original_price']}) {details['discount_percentage']}")
-        
-        # === GAME INFO FROM META TAGS ===
-        print("\n[GAME INFO]")
+        # META TAGS
         try:
             dev_meta = page.locator('meta[itemprop="author"]').first
-            if dev_meta.count() > 0:
-                details["developer"] = safe_text(dev_meta.get_attribute("content"))
+            if await dev_meta.count() > 0:
+                details["developer"] = safe_text(await dev_meta.get_attribute("content"))
         except: pass
         
         try:
             pub_meta = page.locator('meta[itemprop="publisher"]').first
-            if pub_meta.count() > 0:
-                details["publisher"] = safe_text(pub_meta.get_attribute("content"))
+            if await pub_meta.count() > 0:
+                details["publisher"] = safe_text(await pub_meta.get_attribute("content"))
         except: pass
         
         try:
             platform_meta = page.locator('meta[itemprop="gamePlatform"]').first
-            if platform_meta.count() > 0:
-                details["platforms"] = safe_text(platform_meta.get_attribute("content"))
+            if await platform_meta.count() > 0:
+                details["platforms"] = safe_text(await platform_meta.get_attribute("content"))
         except: pass
         
-        # === GAME INFO FROM TABLE ===
+        # TABLE DATA
         try:
-            # Genre from tr.genres
             genre_row = page.locator("tr.genres a.tag").first
-            if genre_row.count() > 0:
-                details["genre"] = safe_text(genre_row.inner_text())
+            if await genre_row.count() > 0:
+                details["genre"] = safe_text(await genre_row.inner_text())
         except: pass
         
         try:
-            # Release date from tr.release-date
             date_row = page.locator("tr.release-date th:nth-child(2)").first
-            if date_row.count() > 0:
-                details["release_date"] = safe_text(date_row.inner_text())
+            if await date_row.count() > 0:
+                details["release_date"] = safe_text(await date_row.inner_text())
         except: pass
         
-        # === DESCRIPTION ===
+        # DESCRIPTION
         try:
             desc_elem = page.locator("span[itemprop='description']").first
-            if desc_elem.count() > 0:
-                desc = desc_elem.inner_text().strip()
-                details["description"] = safe_text(desc[:1000])  # Limit to 1000 chars
+            if await desc_elem.count() > 0:
+                desc = (await desc_elem.inner_text()).strip()
+                details["description"] = safe_text(desc[:1000])
         except: pass
         
-        # Fallback description from .product-text .text
         if details["description"] == "N/A":
             try:
                 desc_elem = page.locator(".product-text .text").first
-                if desc_elem.count() > 0:
-                    desc = desc_elem.inner_text().strip()
+                if await desc_elem.count() > 0:
+                    desc = (await desc_elem.inner_text()).strip()
                     details["description"] = safe_text(desc[:1000])
             except: pass
         
-        print(f"   ✓ {details['developer']} | {details['publisher']} | {details['genre']}")
-        print(f"   ✓ Release: {details['release_date']} | Platform: {details['platforms']}")
-        
-        # === RATINGS & REVIEWS ===
-        print("\n[RATINGS]")
+        # RATINGS
         try:
-            # IG Rating from .ig-search-reviews-avg
             rating_elem = page.locator(".ig-search-reviews-avg").first
-            if rating_elem.count() > 0:
-                details["ig_rating"] = safe_text(rating_elem.inner_text())
+            if await rating_elem.count() > 0:
+                details["ig_rating"] = safe_text(await rating_elem.inner_text())
         except: pass
         
         try:
-            # Review count from .based .link
             review_count_elem = page.locator(".based .link").first
-            if review_count_elem.count() > 0:
-                details["review_count"] = safe_text(review_count_elem.inner_text())
+            if await review_count_elem.count() > 0:
+                details["review_count"] = safe_text(await review_count_elem.inner_text())
         except: pass
         
         try:
-            # Steam recent reviews
             steam_recent = page.locator("tr:has-text('Recent Steam reviews') th:nth-child(2)").first
-            if steam_recent.count() > 0:
-                details["steam_recent_reviews"] = safe_text(steam_recent.inner_text())
+            if await steam_recent.count() > 0:
+                details["steam_recent_reviews"] = safe_text(await steam_recent.inner_text())
         except: pass
         
         try:
-            # Steam all reviews with count
             steam_all_elem = page.locator("tr:has-text('All Steam reviews') th:nth-child(2) span").first
-            if steam_all_elem.count() > 0:
-                details["steam_all_reviews"] = safe_text(steam_all_elem.inner_text())
-                
-            # Steam review count
+            if await steam_all_elem.count() > 0:
+                details["steam_all_reviews"] = safe_text(await steam_all_elem.inner_text())
+            
             steam_count = page.locator("tr:has-text('All Steam reviews') th:nth-child(2) span:nth-child(2)").first
-            if steam_count.count() > 0:
-                count_text = steam_count.inner_text()
-                # Extract number from parentheses
+            if await steam_count.count() > 0:
+                count_text = await steam_count.inner_text()
                 count_match = re.search(r'\((\d+)\)', count_text)
                 if count_match:
                     details["steam_review_count"] = count_match.group(1)
         except: pass
         
-        print(f"   ✓ IG Rating: {details['ig_rating']} | Reviews: {details['review_count']}")
-        print(f"   ✓ Steam: {details['steam_all_reviews']} ({details['steam_review_count']})")
-        
-        # === USER TAGS ===
-        print("\n[TAGS & FEATURES]")
+        # TAGS
         try:
-            tag_links = page.locator(".users-tags a.searchtag").all()
+            tag_links = await page.locator(".users-tags a.searchtag").all()
             tags = []
-            for tag in tag_links[:20]:  # Limit to 20 tags
-                tag_text = tag.inner_text().strip()
+            for tag in tag_links[:20]:
+                tag_text = (await tag.inner_text()).strip()
                 if tag_text and tag_text != "...":
                     tags.append(tag_text)
             details["user_tags"] = tags
-            if tags:
-                print(f"   ✓ User Tags: {len(tags)} found")
         except: pass
         
-        # === GAME FEATURES ===
+        # FEATURES
         try:
-            feature_links = page.locator(".features-listing a.feature .feature-text").all()
+            feature_links = await page.locator(".features-listing a.feature .feature-text").all()
             features = []
             for feat in feature_links:
-                feat_text = feat.inner_text().strip()
+                feat_text = (await feat.inner_text()).strip()
                 if feat_text:
                     features.append(feat_text)
             details["game_features"] = features
-            if features:
-                print(f"   ✓ Game Features: {len(features)} found")
         except: pass
         
-        # === SYSTEM REQUIREMENTS ===
-        print("\n[SYSTEM REQUIREMENTS]")
+        # SYSTEM REQUIREMENTS
         try:
-            # Minimum requirements
-            min_items = page.locator(".minimal ul.specs li").all()
+            min_items = await page.locator(".minimal ul.specs li").all()
             min_reqs = []
             for item in min_items:
-                min_reqs.append(safe_text(item.inner_text()))
+                min_reqs.append(safe_text(await item.inner_text()))
             if min_reqs:
                 details["system_requirements_min"] = " | ".join(min_reqs)
-                print(f"   ✓ Min Requirements: {len(min_reqs)} items")
         except: pass
         
         try:
-            # Recommended requirements
-            rec_items = page.locator(".recommended ul.specs li").all()
+            rec_items = await page.locator(".recommended ul.specs li").all()
             rec_reqs = []
             for item in rec_items:
-                rec_reqs.append(safe_text(item.inner_text()))
+                rec_reqs.append(safe_text(await item.inner_text()))
             if rec_reqs:
                 details["system_requirements_rec"] = " | ".join(rec_reqs)
-                print(f"   ✓ Rec Requirements: {len(rec_reqs)} items")
         except: pass
         
-        # === EDITIONS ===
+        # EDITIONS
         try:
-            edition_items = page.locator(".editions .item").all()
+            edition_items = await page.locator(".editions .item").all()
             editions = []
-            for edition in edition_items[:5]:  # Limit to 5 editions
+            for edition in edition_items[:5]:
                 try:
                     name_elem = edition.locator(".name h3").first
                     price_elem = edition.locator(".amount .total").first
                     
-                    if name_elem.count() > 0 and price_elem.count() > 0:
-                        edition_name = safe_text(name_elem.inner_text())
-                        edition_price = safe_text(price_elem.inner_text())
+                    if await name_elem.count() > 0 and await price_elem.count() > 0:
+                        edition_name = safe_text(await name_elem.inner_text())
+                        edition_price = safe_text(await price_elem.inner_text())
                         editions.append(f"{edition_name}: {edition_price}")
                 except: continue
             
             if editions:
                 details["editions"] = editions
-                print(f"   ✓ Editions: {len(editions)} found")
         except: pass
         
-        # === MEDIA ===
-        print("\n[MEDIA]")
-        
-        # Header image from meta
+        # MEDIA
         try:
             img_meta = page.locator('meta[itemprop="image"]').first
-            if img_meta.count() > 0:
-                details["header_image"] = img_meta.get_attribute("content")
+            if await img_meta.count() > 0:
+                details["header_image"] = await img_meta.get_attribute("content")
                 if download_media_files and details["header_image"] != "N/A":
-                    dl = download_media(details["header_image"], game_media_dir, "cover.jpg")
+                    download_media(details["header_image"], game_media_dir, "cover.jpg")
         except: pass
         
-        # Video from iframe
         try:
             video_iframe = page.locator("#ig-vimeo-player").first
-            if video_iframe.count() > 0:
-                details["video_url"] = video_iframe.get_attribute("src")
-                print(f"   ✓ Video: Found")
+            if await video_iframe.count() > 0:
+                details["video_url"] = await video_iframe.get_attribute("src")
         except: pass
         
-        # Screenshots
         try:
-            screenshot_links = page.locator(".screenshots a[itemprop='screenshot']").all()
+            screenshot_links = await page.locator(".screenshots a[itemprop='screenshot']").all()
             screenshots = []
-            
             for idx, link in enumerate(screenshot_links[:10]):
                 try:
-                    href = link.get_attribute("href")
+                    href = await link.get_attribute("href")
                     if href:
                         screenshots.append(href)
                         if download_media_files:
@@ -301,165 +255,298 @@ def scrape_game_details(page, game_url, game_title, download_media_files=True):
                             elif ".webp" in href.lower(): ext = "webp"
                             download_media(href, game_media_dir, f"screenshot_{idx+1}.{ext}")
                 except: continue
-            
             details["screenshots"] = screenshots
-            if screenshots:
-                print(f"   ✓ Screenshots: {len(screenshots)} found")
         except: pass
         
-        print(f"\n{'='*70}\n✓ COMPLETE: {game_title}\n{'='*70}\n")
         
     except Exception as e:
-        print(f"\n✗✗✗ ERROR: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"✗ Error scraping {game_title}: {e}", flush=True)
     
     return details
 
-def scrape_products_from_page(page, base_url, max_games):
-    """Scrape game listings from homepage."""
-    print(f"\n{'#'*70}\nLOADING HOMEPAGE\n{'#'*70}\n")
+async def scrape_search_page(page, page_num, search_query=""):
+    """Scrape games from search page"""
+    games = []
     
     try:
-        page.goto(base_url, wait_until="load", timeout=60000)
-        page.wait_for_timeout(5000)
-        print("✓ Page loaded")
+        # Build search URL
+        if search_query:
+            base_url = f"https://www.instant-gaming.com/en/search/?q={search_query}"
+        else:
+            # Use generic search to get all games
+            base_url = "https://www.instant-gaming.com/en/search/"
         
-        # Scroll to load more
-        for i in range(5):
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(2000)
+        separator = '&' if '?' in base_url else '?'
+        page_url = f"{base_url}{separator}page={page_num}" if page_num > 1 else base_url
         
-        game_links = []
+        print(f"[Search Page {page_num}] Loading: {page_url[:80]}...", flush=True)
         
-        # Get all game items
-        items = page.locator(".listing-items article.item").all()
-        print(f"✓ Found {len(items)} game items")
+        await page.goto(page_url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(3000)
         
-        for idx, item in enumerate(items[:max_games]):
+        # Scroll to load lazy content
+        for _ in range(5):
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(1000)
+        
+        # Try multiple selectors for game items
+        items = await page.locator(".search article.item, .listing-items article.item, article.item").all()
+        
+        if not items:
+            print(f"[Search Page {page_num}] No items found", flush=True)
+            return games
+        
+        for item in items:
             try:
-                link = item.locator("a.cover").first
-                if link.count() == 0: continue
+                # Try to find the link
+                link = item.locator("a.cover, a.picture, a[href*='/en/']").first
+                if await link.count() == 0: continue
                 
-                href = link.get_attribute("href")
+                href = await link.get_attribute("href")
+                if not href: continue
+                
+                if href.startswith("/"):
+                    href = f"https://www.instant-gaming.com{href}"
+                
+                # Skip non-game links
+                if not re.search(r'/\d+-', href):
+                    continue
                 
                 # Get title
-                title_elem = item.locator(".name .title").first
+                title_elem = item.locator(".name .title, .title, h3").first
                 title = "Unknown"
-                if title_elem.count() > 0:
-                    title = title_elem.get_attribute("title") or title_elem.inner_text().strip()
+                if await title_elem.count() > 0:
+                    title = await title_elem.get_attribute("title")
+                    if not title:
+                        title = (await title_elem.inner_text()).strip()
                 
-                if href:
-                    if href.startswith("/"):
-                        href = f"https://www.instant-gaming.com{href}"
-                    
-                    game_links.append({"url": href, "title": title})
-                    print(f"  [{idx+1}] ✓ {title[:60]}")
-            except: continue
+                # Skip gift cards and non-games
+                skip_keywords = ['gift card', 'points', 'gems', 'credits', 'wallet', 'season pass']
+                if any(skip in title.lower() for skip in skip_keywords):
+                    continue
+                
+                games.append({"url": href, "title": title, "page": page_num})
+                
+            except Exception as e:
+                continue
         
-        # Remove duplicates
-        unique = []
-        seen = set()
-        for g in game_links:
-            if g["url"] not in seen:
-                seen.add(g["url"])
-                unique.append(g)
-        
-        print(f"\n✓ Extracted {len(unique)} unique games\n")
-        return unique[:max_games]
+        print(f"[Search Page {page_num}] ✓ Found {len(games)} games", flush=True)
         
     except Exception as e:
-        print(f"\n✗✗✗ ERROR: {e}")
-        return []
+        print(f"[Search Page {page_num}] ✗ Error: {e}", flush=True)
+    
+    return games
 
-def run_scraper(base_url, max_games, download_media, headless):
-    """Main scraper function."""
+async def scrape_category_pages(browser, max_concurrent=10):
+    """Scrape games from multiple category pages"""
+    
+    categories = [
+        "https://www.instant-gaming.com/en/search/?type%5B%5D=steam",
+        "https://www.instant-gaming.com/en/search/?type%5B%5D=epic",
+        "https://www.instant-gaming.com/en/search/?type%5B%5D=uplay",
+        "https://www.instant-gaming.com/en/search/?type%5B%5D=origin",
+        "https://www.instant-gaming.com/en/search/?type%5B%5D=gog",
+        "https://www.instant-gaming.com/en/search/?platforms%5B%5D=1",  # PC
+        "https://www.instant-gaming.com/en/search/?platforms%5B%5D=7",  # PS5
+        "https://www.instant-gaming.com/en/search/?platforms%5B%5D=5",  # Xbox
+        "https://www.instant-gaming.com/en/search/?sort_by=bestseller",
+        "https://www.instant-gaming.com/en/search/?sort_by=price_asc",
+        "https://www.instant-gaming.com/en/search/?sort_by=release_date",
+    ]
+    
+    all_games = []
+    seen_urls = set()
+    
+    print("\n🎮 Phase 1A: Scraping from multiple categories...", flush=True)
+    
+    for category_url in categories:
+        context = await browser.new_context(
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            viewport={'width': 1920, 'height': 1080}
+        )
+        page = await context.new_page()
+        
+        try:
+            # Get first 3 pages from each category
+            for page_num in range(1, 4):
+                games = await scrape_search_page(page, page_num, "")
+                
+                for game in games:
+                    if game['url'] not in seen_urls:
+                        seen_urls.add(game['url'])
+                        all_games.append(game)
+                
+                await asyncio.sleep(1)  # Be polite
+                
+        except Exception as e:
+            print(f"Error scraping category {category_url[:50]}: {e}", flush=True)
+        finally:
+            await context.close()
+    
+    return all_games
+
+async def scrape_game_worker(game_data, browser, download_media):
+    """Worker function to scrape a single game"""
+    context = await browser.new_context(
+        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        viewport={'width': 1920, 'height': 1080}
+    )
+    page = await context.new_page()
+    
+    try:
+        details = await scrape_game_details(page, game_data['url'], game_data['title'], download_media)
+        print(f"✓ [{game_data.get('index', '?')}] {game_data['title'][:60]}", flush=True)
+        return details
+    except Exception as e:
+        print(f"✗ [{game_data.get('index', '?')}] {game_data['title']}: {e}", flush=True)
+        return None
+    finally:
+        await context.close()
+
+async def run_scraper(max_games, download_media, max_concurrent=10):
+    """Main scraper with async concurrency"""
     print("\n" + "="*70)
-    print("INSTANT GAMING SCRAPER - OPTIMIZED")
+    print("INSTANT GAMING SCRAPER - SEARCH-BASED VERSION")
     print("="*70 + "\n")
     
     os.makedirs("scraped_data", exist_ok=True)
     
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        ctx = browser.new_context(
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            viewport={'width': 1920, 'height': 1080}
-        )
-        page = ctx.new_page()
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
         
-        try:
-            games = scrape_products_from_page(page, base_url, max_games)
-            if not games:
-                return None
-            
-            all_results = []
-            for idx, game in enumerate(games, 1):
-                print(f"\n[{idx}/{len(games)}] {game['title']}")
-                details = scrape_game_details(page, game['url'], game['title'], download_media)
-                all_results.append(details)
-                time.sleep(2)
-            
-            # Convert to DataFrame
-            df = pd.DataFrame(all_results)
-            
-            # Convert lists to pipe-separated strings
-            for col in ['screenshots', 'user_tags', 'game_features', 'editions']:
-                if col in df.columns:
-                    df[col] = df[col].apply(lambda x: '|'.join(x) if isinstance(x, list) and x else 'N/A')
-            
-            # Save CSV with UTF-8
-            df.to_csv("scraped_data/instant_gaming_data.csv", index=False, encoding='utf-8-sig')
+        # PHASE 1: Collect game URLs from categories
+        print(f"PHASE 1: Collecting game URLs (Target: {max_games})")
+        print("="*70)
         
+        all_games = await scrape_category_pages(browser, max_concurrent)
+        
+        print(f"\n✓ Collected {len(all_games)} unique games from categories", flush=True)
+        
+        # If we need more, scrape general search pages
+        if len(all_games) < max_games:
+            print(f"\n🎮 Phase 1B: Scraping general search pages to reach {max_games} games...", flush=True)
             
-            print("\n" + "="*70)
-            print(f"✓ COMPLETE! {len(all_results)} games scraped")
-            print("  CSV: scraped_data/instant_gaming_data.csv")
-            print("="*70 + "\n")
+            pages_needed = ((max_games - len(all_games)) // 30) + 5
+            seen_urls = {g['url'] for g in all_games}
             
-            # Show stats
-            print("DATA QUALITY:")
-            for col in ['current_price', 'developer', 'genre', 'description', 'ig_rating']:
-                if col in df.columns:
-                    non_na = len(df[df[col] != 'N/A'])
-                    print(f"  {col}: {non_na}/{len(df)} ({non_na/len(df)*100:.1f}%)")
+            context = await browser.new_context(
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                viewport={'width': 1920, 'height': 1080}
+            )
+            page = await context.new_page()
             
-            return df
+            for page_num in range(1, pages_needed + 1):
+                games = await scrape_search_page(page, page_num, "")
+                
+                for game in games:
+                    if game['url'] not in seen_urls:
+                        seen_urls.add(game['url'])
+                        all_games.append(game)
+                
+                if len(all_games) >= max_games:
+                    break
+                
+                await asyncio.sleep(1)
             
-        finally:
-            ctx.close()
-            browser.close()
+            await context.close()
+        
+        print(f"\n✓ Total unique games collected: {len(all_games)}", flush=True)
+        print(f"✓ Will scrape {min(len(all_games), max_games)} games", flush=True)
+        
+        if not all_games:
+            print("✗ No games found!", flush=True)
+            await browser.close()
+            return None
+        
+        # Limit to max_games
+        games_to_scrape = all_games[:max_games]
+        
+        # PHASE 2: Scrape each game concurrently
+        print(f"\nPHASE 2: Scraping game details ({len(games_to_scrape)} games)")
+        print("="*70 + "\n")
+        
+        all_results = []
+        
+        # Add index for progress tracking
+        for idx, game in enumerate(games_to_scrape, 1):
+            game['index'] = f"{idx}/{len(games_to_scrape)}"
+        
+        # Create tasks for all games
+        tasks = []
+        for game in games_to_scrape:
+            tasks.append(scrape_game_worker(game, browser, download_media))
+        
+        # Run with concurrency limit
+        completed = 0
+        for i in range(0, len(tasks), max_concurrent):
+            batch = tasks[i:i+max_concurrent]
+            results = await asyncio.gather(*batch, return_exceptions=True)
+            
+            for result in results:
+                if isinstance(result, Exception):
+                    print(f"Error in game worker: {result}", flush=True)
+                    continue
+                    
+                if result:
+                    all_results.append(result)
+                    completed += 1
+                    
+                    # Save backup every 50 games
+                    if completed % 50 == 0:
+                        temp_df = pd.DataFrame(all_results)
+                        for col in ['screenshots', 'user_tags', 'game_features', 'editions']:
+                            if col in temp_df.columns:
+                                temp_df[col] = temp_df[col].apply(lambda x: '|'.join(x) if isinstance(x, list) and x else 'N/A')
+                        temp_df.to_csv("scraped_data/instant_gaming_backup.csv", index=False, encoding='utf-8-sig')
+                        print(f"\n💾 Backup saved: {completed} games\n", flush=True)
+        
+        await browser.close()
+        
+        # Save final results
+        df = pd.DataFrame(all_results)
+        
+        for col in ['screenshots', 'user_tags', 'game_features', 'editions']:
+            if col in df.columns:
+                df[col] = df[col].apply(lambda x: '|'.join(x) if isinstance(x, list) and x else 'N/A')
+        
+        df.to_csv("scraped_data/instant_gaming_data.csv", index=False, encoding='utf-8-sig')
+        
+        print("\n" + "="*70)
+        print(f"✓ SCRAPING COMPLETE!")
+        print(f"  Successfully scraped: {len(all_results)} games")
+        print("  CSV: scraped_data/instant_gaming_data.csv")
+        print("="*70 + "\n")
+        
+        print("DATA QUALITY:")
+        for col in ['current_price', 'developer', 'genre', 'description', 'ig_rating']:
+            if col in df.columns:
+                non_na = len(df[df[col] != 'N/A'])
+                print(f"  {col}: {non_na}/{len(df)} ({non_na/len(df)*100:.1f}%)")
+        
+        return df
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Instant Gaming Scraper - Optimized')
-    parser.add_argument('--url', type=str, default='https://www.instant-gaming.com/en/', 
-                       help='URL to scrape')
-    parser.add_argument('--max-games', type=int, default=20, help='Max games to scrape')
+    parser = argparse.ArgumentParser(description='Instant Gaming Scraper - Search-Based')
+    parser.add_argument('--max-games', type=int, default=700, help='Max games to scrape (default: 700)')
     parser.add_argument('--no-media', action='store_true', help='Skip downloading media')
-    parser.add_argument('--headless', action='store_true', help='Run headless (default: False)')
+    parser.add_argument('--concurrent', type=int, default=10, help='Number of concurrent tasks (default: 10)')
     
     args = parser.parse_args()
     
     print(f"\n{'='*70}\nCONFIGURATION\n{'='*70}")
-    print(f"URL: {args.url}")
     print(f"Max Games: {args.max_games}")
     print(f"Download Media: {not args.no_media}")
-    print(f"Headless: {args.headless}")
+    print(f"Concurrent Tasks: {args.concurrent}")
     print("="*70 + "\n")
     
-    df = run_scraper(args.url, args.max_games, not args.no_media, args.headless)
+    df = asyncio.run(run_scraper(args.max_games, not args.no_media, args.concurrent))
     
     if df is not None:
-        print("\nSAMPLE DATA (first 3 rows):")
+        print("\nSAMPLE DATA (first 5 rows):")
         print("="*70)
         cols = ['title', 'current_price', 'discount_percentage', 'genre', 'ig_rating']
-        print(df[cols].head(3).to_string(index=False))
-        
-# Default: 20 games, with media
-# python scraper.py
+        print(df[cols].head(5).to_string(index=False))
 
-# Headless mode, 50 games, no media
-# python scraper.py --headless --max-games 50 --no-media
-
-# Custom URL
-# python scraper.py --url "https://www.instant-gaming.com/en/search/?type=software"
+# Usage:
+# python instantgaming_fixed.py --max-games 700 --concurrent 15
+# python instantgaming_fixed.py --max-games 500 --concurrent 10 --no-mediac
