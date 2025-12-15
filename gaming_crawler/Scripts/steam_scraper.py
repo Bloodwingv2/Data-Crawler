@@ -17,6 +17,63 @@ import json
 data_lock = Lock()
 all_game_data = []
 
+def convert_steam_rating_to_score(review_text):
+    """
+    Convert Steam's text ratings to numerical scores (0-100).
+    
+    Steam Rating Scale:
+    - Overwhelmingly Positive: 95
+    - Very Positive: 85
+    - Positive: 75
+    - Mostly Positive: 70
+    - Mixed: 50
+    - Mostly Negative: 30
+    - Negative: 25
+    - Very Negative: 15
+    - Overwhelmingly Negative: 5
+    """
+    if not review_text or review_text == "N/A":
+        return None
+    
+    review_lower = review_text.lower()
+    
+    # Define rating mappings
+    rating_map = {
+        'overwhelmingly positive': 95,
+        'very positive': 85,
+        'positive': 75,
+        'mostly positive': 70,
+        'mixed': 50,
+        'mostly negative': 30,
+        'negative': 25,
+        'very negative': 15,
+        'overwhelmingly negative': 5
+    }
+    
+    # Check for each rating type
+    for rating_text, score in rating_map.items():
+        if rating_text in review_lower:
+            return score
+    
+    # If no match found, return None
+    return None
+
+def extract_review_percentage(review_text):
+    """
+    Extract the percentage from Steam's review tooltip.
+    Example: "Very Positive<br>85% of the 12,345 user reviews are positive."
+    Returns the percentage as an integer.
+    """
+    if not review_text or review_text == "N/A":
+        return None
+    
+    # Look for percentage pattern
+    match = re.search(r'(\d+)%', review_text)
+    if match:
+        return int(match.group(1))
+    
+    return None
+
 def create_driver():
     options = webdriver.ChromeOptions()
     options.add_argument('--headless')
@@ -410,11 +467,23 @@ def scrape_game_element(game):
             except:
                 pass
         
+        # Extract review data with numerical conversion
+        review_summary_text = "N/A"
+        rating_score = None
+        rating_percentage = None
+        
         try:
             review_summary_element = game.find_element(By.CSS_SELECTOR, ".search_review_summary")
-            review_summary = review_summary_element.get_attribute("data-tooltip-html") or "N/A"
+            review_summary_text = review_summary_element.get_attribute("data-tooltip-html") or "N/A"
+            
+            # Convert text rating to numerical score
+            rating_score = convert_steam_rating_to_score(review_summary_text)
+            
+            # Extract percentage from tooltip
+            rating_percentage = extract_review_percentage(review_summary_text)
+            
         except:
-            review_summary = "N/A"
+            pass
         
         try:
             game_url = game.get_attribute("href")
@@ -430,9 +499,16 @@ def scrape_game_element(game):
             platforms.append("Linux")
         
         return {
-            "title": title, "release_date": release_date, "original_price": original_price,
-            "price": price, "discount_percentage": discount_pct, "review_summary": review_summary,
-            "url": game_url, "platforms": ", ".join(platforms) if platforms else "N/A"
+            "title": title, 
+            "release_date": release_date, 
+            "original_price": original_price,
+            "price": price, 
+            "discount_percentage": discount_pct, 
+            "review_summary": review_summary_text,
+            "rating_score": rating_score,  # NEW: Numerical rating (0-100)
+            "rating_percentage": rating_percentage,  # NEW: Exact percentage from Steam
+            "url": game_url, 
+            "platforms": ", ".join(platforms) if platforms else "N/A"
         }
     except:
         return None
@@ -456,7 +532,7 @@ def scrape_page_range(worker_id, start_page, end_page, scrape_details=True, down
                     game_data = scrape_game_element(game)
                     if game_data:
                         if scrape_details and game_data["url"] != "N/A":
-                            print(f"[Worker {worker_id}] Scraping: {game_data['title']}")
+                            print(f"[Worker {worker_id}] Scraping: {game_data['title']} (Rating: {game_data['rating_score']})")
                             details = scrape_game_details(driver, game_data["url"], game_data["title"], download_media_files)
                             game_data.update(details)
                             
@@ -493,7 +569,8 @@ def scrape_steam_games(max_games=100, num_workers=5, scrape_details=True, downlo
     
     print(f"🚀 Starting with {num_workers} workers | Target: {max_games} games")
     print(f"🔍 Details: {'ON' if scrape_details else 'OFF'} | Media: {'ON' if download_media_files else 'OFF'}")
-    print(f"🎬 Filter: Games WITHOUT screenshots/videos will be DROPPED\n")
+    print(f"🎬 Filter: Games WITHOUT screenshots/videos will be DROPPED")
+    print(f"⭐ Ratings will be converted to numerical scores (0-100)\n")
     
     start_time = time.time()
     
@@ -545,7 +622,7 @@ def scrape_steam_games(max_games=100, num_workers=5, scrape_details=True, downlo
         print(f"💾 Saved: {output_file}")
         print(f"{'='*60}\n")
         
-        print(df[['title', 'price', 'genres', 'singleplayer', 'multiplayer']].head(10).to_string(index=False))
+        print(df[['title', 'price', 'rating_score', 'rating_percentage', 'genres']].head(10).to_string(index=False))
         
         if scrape_details:
             print(f"\n📊 Stats:")
@@ -555,6 +632,13 @@ def scrape_steam_games(max_games=100, num_workers=5, scrape_details=True, downlo
             print(f"   On sale: {len(df[df['discount_percentage'] != 'N/A'])}")
             print(f"   With screenshots: {len(df[df['screenshots'] != 'N/A'])}")
             print(f"   With videos: {len(df[df['videos'] != 'N/A'])}")
+            
+            # Rating statistics
+            rated_games = df[df['rating_score'].notna()]
+            if len(rated_games) > 0:
+                print(f"   With ratings: {len(rated_games)}")
+                print(f"   Average rating: {rated_games['rating_score'].mean():.1f}/100")
+                print(f"   Highest rated: {rated_games['rating_score'].max()}/100")
     else:
         print("❌ No games scraped")
     
@@ -563,7 +647,7 @@ def scrape_steam_games(max_games=100, num_workers=5, scrape_details=True, downlo
 if __name__ == "__main__":
     start = time.perf_counter()
     # Full scrape with media (start small!)
-    scrape_steam_games(max_games=600, num_workers=25, scrape_details=True, download_media_files=True)
+    scrape_steam_games(max_games=50, num_workers=10, scrape_details=True, download_media_files=True)
     end = time.perf_counter()
     print(f"Total execution time: {end - start:.4f} seconds")
     # Increase number of workers above for faster scraping on powerful machines
