@@ -11,3 +11,6 @@ dependencies = [
     "undetected-chromedriver>=3.5.5",
     "webdriver-manager>=4.0.2",
 ]
+
+    INPUT_FILE = "scraped_data/prime_data.csv"
+    OUTPUT_FILE = "scraped_data/Master_Dataset_cleaned.csv"
