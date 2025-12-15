@@ -208,29 +208,24 @@ def apply_business_rules(df):
     print("="*60)
     
     # Rule 1: Games with no prices -> mark as free (0.0)
-    # We assume 'discounted_price' is the final price column.
     missing_price = df['discounted_price'].isna().sum()
     df['discounted_price'] = df['discounted_price'].fillna(0.0)
     df['original_price'] = df['original_price'].fillna(0.0)
     print(f"   ✓ Rule 1: Marked {missing_price} games with no price data as 'Free' (0.0)")
 
     # Rule 2: Games with no reviews -> mark as 'Not yet rated'
-    # "No reviews" implies review_count is NaN or 0.
-    # We must convert 'rating' to object type to hold strings.
     df['rating'] = df['rating'].astype('object')
-    
-    # Identify rows with no reviews
     no_reviews_mask = (df['review_count'].isna()) | (df['review_count'] == 0)
-    
-    # Apply label
     df.loc[no_reviews_mask, 'rating'] = "Not yet rated"
     print(f"   ✓ Rule 2: Marked {no_reviews_mask.sum()} games with no reviews as 'Not yet rated'")
 
-    # Rule 3: Games with no devs AND publishers -> drop them
-    before_drop = len(df)
-    df = df.dropna(subset=['developer', 'publisher'], how='all')
-    dropped_count = before_drop - len(df)
-    print(f"   ✓ Rule 3: Dropped {dropped_count} games with missing Developer AND Publisher")
+    # Rule 3: Games with no release date -> mark as "Not yet released"
+    missing_dates = df['release_date'].isna().sum()
+    df['release_date'] = df['release_date'].fillna("Not yet released")
+    print(f"   ✓ Rule 3: Marked {missing_dates} games with no date as 'Not yet released'")
+
+    # Rule 4 (Previous request): Keeping games with missing Developer/Publisher info
+    print(f"   ✓ Rule 4: Keeping games with missing Developer/Publisher info (no drops)")
     
     return df
 
@@ -265,6 +260,7 @@ def generate_quality_report(df):
         print(f"   Range: {numeric_ratings.min():.1f} - {numeric_ratings.max():.1f}")
         
     print(f"\n   'Not yet rated' count: {len(df[df['rating'] == 'Not yet rated'])}")
+    print(f"   'Not yet released' count: {len(df[df['release_date'] == 'Not yet released'])}")
     
     if 'discounted_price' in df.columns:
         print("\nPrice statistics:")
@@ -319,14 +315,13 @@ def merge_game_data(steam_path, instant_gaming_path, gog_path, output_path='Mast
     merged = pd.concat([steam_df, ig_df, gog_df], ignore_index=True, sort=False)
     merged = create_unified_schema(merged)
     
-    # 5. Apply Business Rules (The specific user request)
+    # 5. Apply Business Rules
     merged = apply_business_rules(merged)
     
     # 6. Deduplicate
     print("\n4. Deduplicating...")
     before = len(merged)
     # Convert rating to numeric specifically for sorting logic (best rated first)
-    # We temporarily use a numeric column for sorting
     merged['rating_sort'] = pd.to_numeric(merged['rating'], errors='coerce').fillna(-1)
     
     merged['temp_title'] = merged['game_title'].str.lower().str.strip()

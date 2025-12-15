@@ -549,4 +549,4 @@ if __name__ == "__main__":
 
 # Usage:
 # python instantgaming_fixed.py --max-games 700 --concurrent 15
-# python instantgaming_fixed.py --max-games 500 --concurrent 10 --no-mediac
+# python instantgaming_fixed.py --max-games 500 --concurrent 10 --no-media
