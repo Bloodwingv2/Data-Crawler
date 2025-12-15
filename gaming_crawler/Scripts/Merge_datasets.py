@@ -76,47 +76,19 @@ def extract_genres(genres_value):
     cleaned = [g.title() for g in genres if g and len(g) > 1]
     return ', '.join(cleaned) if cleaned else None
 
-def extract_platform_from_title(title):
-    """Extract platform from Instant Gaming titles like 'Game Name - PC (Steam)'"""
-    if pd.isna(title):
-        return None
-    
-    title_str = str(title)
-    platforms = []
-    
-    # Look for platform indicators in title
-    if re.search(r'\b(PC|Windows)\b', title_str, re.IGNORECASE):
-        platforms.append('Windows')
-    if re.search(r'\bMac\b', title_str, re.IGNORECASE):
-        platforms.append('Mac')
-    if re.search(r'\bLinux\b', title_str, re.IGNORECASE):
-        platforms.append('Linux')
-    
-    return ', '.join(platforms) if platforms else None
-
-def standardize_platform(platform_value):
-    """Standardize platform names"""
+def clean_platform(platform_value):
+    """Clean platform data without standardizing"""
     if pd.isna(platform_value) or platform_value == "N/A" or platform_value == "":
         return None
     
-    platform_str = str(platform_value).lower().strip()
-    platforms = []
+    platform_str = str(platform_value).strip()
     
-    # Check for Windows - be more flexible with matching
-    if any(x in platform_str for x in ['windows', 'win', 'pc', 'steam', 'ea app', 'ubisoft', 'microsoft', 'xbox']):
-        platforms.append('Windows')
+    # Handle empty or meaningless values
+    if platform_str.lower() in ['', 'n/a', 'none', 'null']:
+        return None
     
-    # Check for Mac
-    if any(x in platform_str for x in ['mac', 'macos', 'osx', 'os x']):
-        if 'Mac' not in platforms:
-            platforms.append('Mac')
-    
-    # Check for Linux
-    if any(x in platform_str for x in ['linux', 'steamos']):
-        platforms.append('Linux')
-    
-    result = ', '.join(platforms) if platforms else None
-    return result
+    # Just clean whitespace and return as-is
+    return platform_str if platform_str else None
 
 def calculate_discounted_price(row):
     """Calculate discounted price from original and discount"""
@@ -140,7 +112,25 @@ def map_columns_to_standard(df, source):
         'instant_gaming': {'title': 'game_title', 'ig_rating': 'rating_raw', 'url': 'game_url', 'genre': 'genres'},
         'GOG': {'title': 'game_title', 'rating': 'rating_raw', 'url': 'game_url'}
     }
-    return df.rename(columns=mappings.get(source, {}))
+    renamed = df.rename(columns=mappings.get(source, {}))
+    
+    # Debug: Print column names after mapping
+    print(f"   Columns after mapping: {list(renamed.columns)}")
+    if 'platforms' in renamed.columns:
+        print(f"   ✓ 'platforms' column found")
+        # Show sample values
+        sample_platforms = renamed['platforms'].dropna().head(3).tolist()
+        if sample_platforms:
+            print(f"   Sample platform values: {sample_platforms}")
+    elif 'platform' in renamed.columns:
+        print(f"   ✓ 'platform' column found (singular)")
+        sample_platforms = renamed['platform'].dropna().head(3).tolist()
+        if sample_platforms:
+            print(f"   Sample platform values: {sample_platforms}")
+    else:
+        print(f"   ⚠️  No 'platforms' or 'platform' column found!")
+    
+    return renamed
 
 def validate_and_clean_data(df, source):
     """Clean and validate data"""
@@ -190,21 +180,33 @@ def validate_and_clean_data(df, source):
         df['genres'] = df['genre'].apply(extract_genres)
         df = df.drop(columns=['genre'])
     
-    # Standardize platforms - handle 'platforms' column (all sources use this name)
-    if 'platforms' in df.columns:
-        print(f"   Processing platforms column...")
-        df['platform'] = df['platforms'].apply(standardize_platform)
-        df = df.drop(columns=['platforms'])
-    elif 'platform' in df.columns:
-        print(f"   Processing platform column...")
-        df['platform'] = df['platform'].apply(standardize_platform)
+    # FIXED: Process platforms - handle both 'platforms' (plural) and 'platform' (singular)
+    print(f"   Processing platform data for {source}...")
     
-    # For Instant Gaming, if platform is still None, try extracting from title
-    if source == 'instant_gaming' and 'platform' in df.columns and 'game_title' in df.columns:
-        missing_platform = df['platform'].isna()
-        if missing_platform.any():
-            print(f"   Extracting platforms from titles for {missing_platform.sum()} games...")
-            df.loc[missing_platform, 'platform'] = df.loc[missing_platform, 'game_title'].apply(extract_platform_from_title)
+    if 'platforms' in df.columns:
+        print(f"   Found 'platforms' column (plural) - cleaning...")
+        non_null_count = df['platforms'].notna().sum()
+        print(f"   Non-null platform entries: {non_null_count}/{len(df)}")
+        
+        # Clean the platforms column without standardizing
+        df['platform'] = df['platforms'].apply(clean_platform)
+        df = df.drop(columns=['platforms'])
+        
+        # Count successful cleaning
+        success_count = df['platform'].notna().sum()
+        print(f"   Successfully cleaned: {success_count}/{non_null_count} entries")
+        
+    elif 'platform' in df.columns:
+        print(f"   Found 'platform' column (singular) - cleaning...")
+        non_null_count = df['platform'].notna().sum()
+        print(f"   Non-null platform entries: {non_null_count}/{len(df)}")
+        
+        df['platform'] = df['platform'].apply(clean_platform)
+        
+        success_count = df['platform'].notna().sum()
+        print(f"   Successfully cleaned: {success_count}/{non_null_count} entries")
+    else:
+        print(f"   ⚠️  No platform column found in {source} data!")
     
     # Remove invalid titles
     if 'game_title' in df.columns:
@@ -231,7 +233,7 @@ def remove_reference_columns(df):
                     'stock_status', 'categories', 'background_image', 'clip']
     existing = [col for col in cols_to_drop if col in df.columns]
     if existing:
-        print(f"   Dropping: {', '.join(existing)}")
+        print(f"   Dropping reference columns: {', '.join(existing)}")
         df = df.drop(columns=existing)
     return df
 
@@ -289,10 +291,18 @@ def generate_quality_report(df):
             print(f"   {status} {field}: {filled}/{len(df)} ({pct:.1f}%)")
     
     if 'platform' in df.columns:
-        print("\nPlatform availability:")
-        for plat in ['Windows', 'Mac', 'Linux']:
-            count = df[df['platform'].fillna('').str.contains(plat, case=False)].shape[0]
+        print("\nPlatform availability (raw values):")
+        # Show top platform values
+        platform_counts = df['platform'].value_counts().head(10)
+        for plat, count in platform_counts.items():
             print(f"   {plat}: {count} ({count/len(df)*100:.1f}%)")
+        
+        # Show platform distribution by source
+        print("\nPlatform coverage by source:")
+        for source in df['data_source'].unique():
+            source_df = df[df['data_source'] == source]
+            plat_count = source_df['platform'].notna().sum()
+            print(f"   {source}: {plat_count}/{len(source_df)} ({plat_count/len(source_df)*100:.1f}%)")
 
 def merge_game_data(steam_path, instant_gaming_path, gog_path, output_path='Master_Dataset.csv'):
     """Merge and normalize gaming datasets"""
