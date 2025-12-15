@@ -548,5 +548,5 @@ if __name__ == "__main__":
         print(df[cols].head(5).to_string(index=False))
 
 # Usage:
-# python instantgaming_fixed.py --max-games 700 --concurrent 15
-# python instantgaming_fixed.py --max-games 500 --concurrent 10 --no-media
+# python instantgaming.py --max-games 700 --concurrent 15
+# python instantgaming.py --max-games 500 --concurrent 10 --no-media
