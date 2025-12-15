@@ -48,7 +48,7 @@ def fix_encoding(text):
 # ==========================================
 def main():
     INPUT_FILE = "scraped_data/Master_Dataset.csv"
-    OUTPUT_FILE = "scraped_data/Master_Dataset_cleaned.csv"
+    OUTPUT_FILE = "scraped_data/Master_Dataset_Final.csv"
 
     # Read with explicit UTF-8 encoding
     df = pd.read_csv(INPUT_FILE, encoding='utf-8', encoding_errors='replace')
