@@ -1,11 +1,5 @@
 import pandas as pd
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 import time
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -13,126 +7,38 @@ from threading import Lock
 import requests
 import re
 import json
+from typing import Optional, Dict, List
 
 data_lock = Lock()
 all_game_data = []
 
 def convert_steam_rating_to_score(review_text):
-    """
-    Convert Steam's text ratings to numerical scores (0-100).
-    
-    Steam Rating Scale:
-    - Overwhelmingly Positive: 95
-    - Very Positive: 85
-    - Positive: 75
-    - Mostly Positive: 70
-    - Mixed: 50
-    - Mostly Negative: 30
-    - Negative: 25
-    - Very Negative: 15
-    - Overwhelmingly Negative: 5
-    """
+    """Convert Steam's text ratings to numerical scores (0-100)."""
     if not review_text or review_text == "N/A":
         return None
     
     review_lower = review_text.lower()
-    
-    # Define rating mappings
     rating_map = {
-        'overwhelmingly positive': 95,
-        'very positive': 85,
-        'positive': 75,
-        'mostly positive': 70,
-        'mixed': 50,
-        'mostly negative': 30,
-        'negative': 25,
-        'very negative': 15,
-        'overwhelmingly negative': 5
+        'overwhelmingly positive': 95, 'very positive': 85, 'positive': 75,
+        'mostly positive': 70, 'mixed': 50, 'mostly negative': 30,
+        'negative': 25, 'very negative': 15, 'overwhelmingly negative': 5
     }
     
-    # Check for each rating type
     for rating_text, score in rating_map.items():
         if rating_text in review_lower:
             return score
-    
-    # If no match found, return None
     return None
 
 def extract_review_percentage(review_text):
-    """
-    Extract the percentage from Steam's review tooltip.
-    Example: "Very Positive<br>85% of the 12,345 user reviews are positive."
-    Returns the percentage as an integer.
-    """
+    """Extract the percentage from Steam's review tooltip."""
     if not review_text or review_text == "N/A":
         return None
-    
-    # Look for percentage pattern
     match = re.search(r'(\d+)%', review_text)
-    if match:
-        return int(match.group(1))
-    
-    return None
-
-def create_driver():
-    options = webdriver.ChromeOptions()
-    options.add_argument('--headless')
-    options.add_argument('--disable-blink-features=AutomationControlled')
-    options.add_argument('--no-sandbox')
-    options.add_argument('--disable-dev-shm-usage')
-    options.add_argument('--disable-gpu')
-    options.add_argument('--window-size=1920,1080')
-    options.add_experimental_option("excludeSwitches", ["enable-logging"])
-    service = Service(ChromeDriverManager().install())
-    return webdriver.Chrome(service=service, options=options)
-
-def download_media(url, save_dir, filename):
-    try:
-        # Special handling for video manifests (m3u8, mpd)
-        if url.endswith('.m3u8') or url.endswith('.mpd'):
-            # Save the manifest URL to a text file instead
-            filepath = os.path.join(save_dir, filename.replace('.mp4', '.txt').replace('.webm', '.txt'))
-            with open(filepath, 'w') as f:
-                f.write(f"Video Manifest URL:\n{url}\n\n")
-                f.write("Note: This is an HLS/DASH manifest. Use a video player that supports streaming (VLC, ffmpeg) to download/play.\n")
-                f.write(f"\nTo download with ffmpeg:\nffmpeg -i \"{url}\" -c copy \"{filename.replace('.txt', '.mp4')}\"\n")
-            return filepath
-        
-        # Regular download for images and direct video files
-        response = requests.get(url, timeout=15, stream=True, headers={
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
-        if response.status_code == 200:
-            filepath = os.path.join(save_dir, filename)
-            with open(filepath, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            return filepath
-    except Exception as e:
-        print(f"   Error downloading {filename}: {e}")
-    return None
-
-def handle_age_gate(driver):
-    try:
-        age_gate = driver.find_elements(By.CSS_SELECTOR, ".agegate_birthday_selector")
-        if age_gate:
-            year_select = driver.find_element(By.ID, "ageYear")
-            year_select.click()
-            time.sleep(0.3)
-            year_options = driver.find_elements(By.CSS_SELECTOR, "#ageYear option")
-            if len(year_options) > 10:
-                year_options[10].click()
-            driver.find_element(By.CSS_SELECTOR, "#age_gate_btn_continue").click()
-            time.sleep(2)
-    except:
-        pass
+    return int(match.group(1)) if match else None
 
 def convert_hls_to_direct_url(hls_url):
-    """Convert HLS manifest URL to direct video URLs."""
+    """Convert HLS manifest URL to direct video URLs - FROM SELENIUM VERSION."""
     try:
-        # Pattern: https://video.akamai.steamstatic.com/store_trailers/252490/824633/.../hls_264_master.m3u8
-        # Steam structure: base_url + video_id + hash + timestamp + filename
-        
         # Remove the HLS filename and query params
         base_url = hls_url.split('/hls_')[0] + '/'
         
@@ -144,41 +50,89 @@ def convert_hls_to_direct_url(hls_url):
             base_url + 'movie480.webm',           # Standard WebM
             base_url + 'movie_max.mp4',           # Highest quality MP4
             base_url + 'movie480.mp4',            # Standard MP4
-            hls_url  # Keep original as fallback
         ]
         
         return possible_formats
     except:
-        return [hls_url]
+        return []
 
-def extract_video_urls(driver):
-    """Extract game trailer URLs from Steam's JSON data-props and embedded videos."""
-    video_urls = []
+def download_media(url, save_dir, filename):
+    """Download media file from URL - handles HLS manifest conversion."""
     try:
-        # Wait for the page to fully load
-        time.sleep(3)
+        # For HLS manifests, save URL info for manual download
+        if url.endswith('.m3u8') or url.endswith('.mpd'):
+            filepath = os.path.join(save_dir, filename.replace('.webm', '.txt').replace('.mp4', '.txt'))
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(f"Video Manifest URL:\n{url}\n\n")
+                f.write("Note: This is an HLS/DASH manifest. Use ffmpeg to download:\n")
+                f.write(f'ffmpeg -i "{url}" -c copy "{filename.replace(".txt", ".mp4")}"\n')
+            return filepath
         
+        # Regular download for images and direct video files
+        response = requests.get(url, timeout=15, stream=True, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://store.steampowered.com/'
+        })
+        
+        if response.status_code == 200:
+            filepath = os.path.join(save_dir, filename)
+            with open(filepath, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            
+            # Verify file was downloaded
+            if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                return filepath
+            else:
+                print(f"   ⚠️ Downloaded file is empty")
+                return None
+        else:
+            print(f"   HTTP {response.status_code} for {filename}")
+            return None
+            
+    except Exception as e:
+        print(f"   Download error {filename}: {str(e)[:50]}")
+    return None
+
+def handle_age_gate(page):
+    """Handle Steam age verification gate - FAST version."""
+    try:
+        if page.locator(".agegate_birthday_selector").is_visible(timeout=500):
+            page.select_option("#ageYear", "1990")
+            page.click("#age_gate_btn_continue")
+            page.wait_for_load_state("domcontentloaded", timeout=5000)
+            return True
+    except:
+        pass
+    return False
+
+def extract_video_urls(page, page_content: str) -> List[str]:
+    """
+    Extract game trailer URLs - ENHANCED VERSION from Selenium scraper.
+    Prioritizes direct video files over HLS manifests.
+    """
+    video_urls = []
+    
+    try:
         # Method 0: Extract embedded videos from game description (BEST - actual video files!)
         try:
-            # Find all <video> tags with <source> elements
-            video_elements = driver.find_elements(By.CSS_SELECTOR, "video source[src*='.webm'], video source[src*='.mp4']")
+            video_elements = page.locator("video source[src*='.webm'], video source[src*='.mp4']").all()
             
-            for video_elem in video_elements[:3]:  # Limit to 3
+            for video_elem in video_elements[:3]:
                 try:
                     video_url = video_elem.get_attribute("src")
                     if video_url and 'store_item_assets' in video_url:
-                        # These are direct video files from game description
                         video_urls.append(video_url)
-                        print(f"   Found embedded video: {video_url[:100]}...")
+                        print(f"      ✓ Embedded video: {video_url[:80]}...")
                 except:
                     continue
             
             if video_urls:
-                print(f"   Total embedded videos: {len(video_urls)}")
+                print(f"      Found {len(video_urls)} embedded videos")
         except Exception as e:
-            print(f"   Embedded video search error: {e}")
+            pass
         
-        # Method 1: Parse the data-props JSON for trailers
+        # Method 1: Parse data-props JSON for trailers
         if len(video_urls) < 3:
             try:
                 selectors = [
@@ -191,13 +145,13 @@ def extract_video_urls(driver):
                 carousel = None
                 for selector in selectors:
                     try:
-                        carousel = driver.find_element(By.CSS_SELECTOR, selector)
-                        if carousel:
+                        carousel = page.locator(selector).first
+                        if carousel.count() > 0:
                             break
                     except:
                         continue
                 
-                if carousel:
+                if carousel and carousel.count() > 0:
                     data_props = carousel.get_attribute("data-props")
                     
                     if data_props:
@@ -207,7 +161,7 @@ def extract_video_urls(driver):
                         # Parse the JSON data
                         data = json.loads(data_props)
                         
-                        # Extract trailer URLs from the "trailers" array
+                        # Extract trailer URLs
                         if "trailers" in data and isinstance(data["trailers"], list):
                             for trailer in data["trailers"][:3]:
                                 # Get HLS manifest and convert to direct URLs
@@ -221,72 +175,70 @@ def extract_video_urls(driver):
                                     for url in possible_urls:
                                         if not url.endswith('.m3u8'):
                                             video_urls.append(url)
-                                            print(f"   Added converted HLS: {url[:100]}...")
+                                            print(f"      ✓ Converted HLS: {url[:80]}...")
                                             break
                                     else:
                                         # If no direct URL, keep HLS as last resort
                                         video_urls.append(hls_url)
-                                        print(f"   Added HLS manifest: {hls_url[:100]}...")
+                                        print(f"      HLS manifest: {hls_url[:80]}...")
                                         
                                 # Fallback to DASH manifest
                                 elif "dashManifests" in trailer and trailer["dashManifests"] and len(trailer["dashManifests"]) > 0:
                                     url = trailer["dashManifests"][0].replace('\\/', '/')
                                     video_urls.append(url)
-                                    print(f"   Added DASH: {url[:100]}...")
+                                    print(f"      DASH: {url[:80]}...")
                         
                         if len(video_urls) > 0:
-                            print(f"   Total from data-props: {len(video_urls)} trailer(s)")
+                            print(f"      Found {len(video_urls)} from data-props")
                     
             except json.JSONDecodeError as e:
-                print(f"   JSON decode error: {e}")
+                pass
             except Exception as e:
-                print(f"   data-props error: {e}")
+                pass
         
         # Method 2: Regex search for embedded video URLs in page source
         if len(video_urls) < 3:
             try:
-                page_source = driver.page_source
-                
                 # Pattern for embedded game description videos (direct files!)
-                embedded_pattern = r'https?://shared\.fastly\.steamstatic\.com/store_item_assets/steam/apps/\d+/extras/[^"\'<>\s]+\.webm[^"\'<>\s]*'
-                embedded_matches = re.findall(embedded_pattern, page_source)
+                embedded_pattern = r'https://shared\.fastly\.steamstatic\.com/store_item_assets/steam/apps/\d+/extras/[^"\'<>\s]+\.webm'
+                embedded_matches = re.findall(embedded_pattern, page_content)
                 
                 for url in embedded_matches[:3]:
                     if url not in video_urls:
                         video_urls.append(url)
-                        print(f"   Found via regex: {url[:100]}...")
+                        print(f"      ✓ Regex embedded: {url[:80]}...")
                         if len(video_urls) >= 3:
                             break
                 
                 # Also search for direct trailer videos
                 video_patterns = [
-                    r'https?://video\.[^"\'<>\s]+/store_trailers/[^"\'<>\s]+/movie480_vp9\.webm',
-                    r'https?://video\.[^"\'<>\s]+/store_trailers/[^"\'<>\s]+/movie_max_vp9\.webm',
-                    r'https?://video\.[^"\'<>\s]+/store_trailers/[^"\'<>\s]+/movie480\.webm',
-                    r'https?://cdn\.[^"\'<>\s]+/steam/apps/\d+/movie480\.webm',
+                    r'https://video\.[^"\'<>\s]+/store_trailers/[^"\'<>\s]+/movie480_vp9\.webm',
+                    r'https://video\.[^"\'<>\s]+/store_trailers/[^"\'<>\s]+/movie_max_vp9\.webm',
+                    r'https://video\.[^"\'<>\s]+/store_trailers/[^"\'<>\s]+/movie480\.webm',
+                    r'https://cdn\.[^"\'<>\s]+/steam/apps/\d+/movie480\.webm',
                 ]
                 
                 exclude_keywords = ['steamdeck', 'hardware']
                 
                 for pattern in video_patterns:
-                    matches = re.findall(pattern, page_source)
+                    matches = re.findall(pattern, page_content)
                     for url in matches:
                         if not any(kw in url.lower() for kw in exclude_keywords):
                             if url not in video_urls:
                                 video_urls.append(url)
-                                print(f"   Found trailer: {url[:100]}...")
+                                print(f"      ✓ Regex trailer: {url[:80]}...")
                                 if len(video_urls) >= 3:
                                     break
                     if len(video_urls) >= 3:
                         break
                 
             except Exception as e:
-                print(f"   Regex error: {e}")
+                pass
         
         # Method 3: Construct URLs from app ID as last resort
         if len(video_urls) == 0:
             try:
-                current_url = driver.current_url
+                current_url = page.url
                 app_id_match = re.search(r'/app/(\d+)/', current_url)
                 
                 if app_id_match:
@@ -298,12 +250,12 @@ def extract_video_urls(driver):
                     ]
                     
                     video_urls.append(constructed_urls[0])
-                    print(f"   Added constructed: {constructed_urls[0]}")
+                    print(f"      Constructed: {constructed_urls[0][:80]}")
             except Exception as e:
-                print(f"   Construction error: {e}")
+                pass
             
     except Exception as e:
-        print(f"   Fatal error: {e}")
+        print(f"   Fatal video error: {e}")
     
     # Return unique URLs, limit to 3
     unique_urls = []
@@ -313,249 +265,324 @@ def extract_video_urls(driver):
     
     return unique_urls[:3]
 
-def has_media_content(screenshots, videos):
-    """Check if game has valid screenshots or videos."""
-    has_screenshots = screenshots != "N/A" and screenshots.strip() != ""
-    has_videos = videos != "N/A" and videos.strip() != ""
-    return has_screenshots or has_videos
-
-def scrape_game_details(driver, game_url, game_title, download_media_files=True):
+def scrape_game_details(page, game_url, game_title, download_media_files=True):
+    """Scrape detailed game information - ENHANCED with better video extraction."""
+    # ADDED developer and publisher to default dictionary
     details = {
-        "genres": "N/A", "categories": "N/A", "multiplayer": "No", "singleplayer": "No",
-        "system_requirements_windows": "N/A", "system_requirements_mac": "N/A",
-        "system_requirements_linux": "N/A", "header_image": "N/A",
-        "screenshots": "N/A", "videos": "N/A", "downloaded_images": [],
-        "downloaded_videos": []
+        "genres": "N/A", "developer": "N/A", "publisher": "N/A", 
+        "categories": "N/A", "multiplayer": "No", "singleplayer": "No",
+        "system_requirements_windows": "N/A", "header_image": "N/A",
+        "screenshots": "N/A", "videos": "N/A",
+        "downloaded_images": [], "downloaded_videos": []
     }
     
     try:
-        driver.get(game_url)
-        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, "body")))
-        time.sleep(2)
-        handle_age_gate(driver)
+        # Navigate with shorter timeout
+        page.goto(game_url, wait_until="domcontentloaded", timeout=15000)
+        handle_age_gate(page)
         
-        # Genres
+        # Wait for essential content only
         try:
-            genres = [g.text.strip() for g in driver.find_elements(By.CSS_SELECTOR, ".details_block a[href*='genre']") if g.text.strip()]
-            details["genres"] = ", ".join(genres) if genres else "N/A"
+            page.wait_for_selector(".game_page_background, .page_content", timeout=3000)
         except:
             pass
         
-        # Categories & Multiplayer/Singleplayer
+        # Wait a bit for videos to load
+        time.sleep(2)
+        
+        # Get page content once for regex extraction
+        page_content = page.content()
+        
+        # === FAST DATA EXTRACTION ===
+        
+        # Developer and Publisher Extraction
+        try:
+            # Targeting the specific ID you provided: appHeaderGridContainer
+            grid_container = page.locator("#appHeaderGridContainer")
+            if grid_container.count() > 0:
+                # Developer is usually the first content block in the grid
+                dev_text = grid_container.locator(".grid_content").first.inner_text()
+                details["developer"] = dev_text.strip() if dev_text else "N/A"
+                
+                # Publisher is usually the second content block in the grid
+                pub_text = grid_container.locator(".grid_content").nth(1).inner_text()
+                details["publisher"] = pub_text.strip() if pub_text else "N/A"
+        except:
+            pass
+
+        # Genres - single query
+        try:
+            genres = page.locator(".details_block a[href*='genre']").all_inner_texts()
+            details["genres"] = ", ".join([g.strip() for g in genres if g.strip()]) or "N/A"
+        except:
+            pass
+        
+        # Categories + Multiplayer detection
         try:
             categories = []
-            for cat in driver.find_elements(By.CSS_SELECTOR, ".game_area_features_list a, .label"):
-                cat_text = cat.text.strip()
+            cats = page.locator(".game_area_features_list_ctn a").all_inner_texts()
+            for cat_text in cats:
                 if cat_text:
                     categories.append(cat_text)
-                    if "multi-player" in cat_text.lower() or "multiplayer" in cat_text.lower():
+                    cat_lower = cat_text.lower()
+                    if "multi" in cat_lower:
                         details["multiplayer"] = "Yes"
-                    if "single-player" in cat_text.lower() or "singleplayer" in cat_text.lower():
+                    if "single" in cat_lower:
                         details["singleplayer"] = "Yes"
-            details["categories"] = ", ".join(set(categories)) if categories else "N/A"
+            details["categories"] = ", ".join(set(categories)[:10]) if categories else "N/A"
         except:
             pass
         
-        # System Requirements
+        # System Requirements (Windows only, simplified)
         try:
-            win_req = driver.find_element(By.CSS_SELECTOR, ".game_area_sys_req_leftCol, .game_area_sys_req_full")
-            details["system_requirements_windows"] = win_req.text.strip() or "N/A"
+            req = page.locator(".game_area_sys_req_leftCol, .sysreq_contents").first
+            if req.is_visible(timeout=1000):
+                req_text = req.inner_text(timeout=500).strip()[:300]
+                if req_text:
+                    details["system_requirements_windows"] = req_text
         except:
             pass
         
+        # === MEDIA EXTRACTION ===
+        
+        # Header image
         try:
-            mac_req = driver.find_element(By.CSS_SELECTOR, ".game_area_sys_req_rightCol")
-            req_text = mac_req.text.strip()
-            if "mac" in req_text.lower() or "os x" in req_text.lower():
-                details["system_requirements_mac"] = req_text
+            header = page.locator(".game_header_image_full").first
+            if header.is_visible(timeout=1000):
+                details["header_image"] = header.get_attribute("src")
         except:
             pass
         
+        # Screenshots
         try:
-            for elem in driver.find_elements(By.CSS_SELECTOR, ".game_area_sys_req"):
-                req_text = elem.text.strip()
-                if "linux" in req_text.lower() or "steamos" in req_text.lower():
-                    details["system_requirements_linux"] = req_text
-                    break
+            screenshot_imgs = page.locator(".highlight_screenshot img, .screenshot_holder img").all()
+            urls = []
+            for img in screenshot_imgs[:10]:
+                src = img.get_attribute("src")
+                if src and "steam" in src:
+                    full_url = src.replace("116x65", "1920x1080").replace(".116x65", "")
+                    urls.append(full_url)
+            if urls:
+                details["screenshots"] = ", ".join(urls)
         except:
             pass
         
-        # Media
-        if download_media_files:
+        # Videos - ENHANCED extraction using Selenium method
+        try:
+            video_urls = extract_video_urls(page, page_content)
+            if video_urls:
+                details["videos"] = ", ".join(video_urls)
+        except Exception as e:
+            print(f"   Video extraction error: {e}")
+        
+        # === DOWNLOAD MEDIA ===
+        if download_media_files and (details["screenshots"] != "N/A" or details["videos"] != "N/A"):
             safe_title = re.sub(r'[<>:"/\\|?*]', '', game_title)[:50]
             script_dir = os.path.dirname(os.path.abspath(__file__))
             game_media_dir = os.path.join(script_dir, "scraped_data", "steam_media", safe_title)
             os.makedirs(game_media_dir, exist_ok=True)
             
-            # Header Image
-            try:
-                header_img = driver.find_element(By.CSS_SELECTOR, ".game_header_image_full")
-                img_url = header_img.get_attribute("src")
-                details["header_image"] = img_url
-                downloaded = download_media(img_url, game_media_dir, "header.jpg")
+            # Download header
+            if details["header_image"] != "N/A":
+                downloaded = download_media(details["header_image"], game_media_dir, "header.jpg")
                 if downloaded:
                     details["downloaded_images"].append(downloaded)
-            except:
-                pass
             
-            # Screenshots
-            try:
-                screenshot_urls = []
-                for idx, img in enumerate(driver.find_elements(By.CSS_SELECTOR, ".highlight_screenshot_link img, .screenshot_holder a img")[:5]):
+            # Download screenshots (max 5)
+            if details["screenshots"] != "N/A":
+                screenshot_urls = details["screenshots"].split(", ")
+                for idx, img_url in enumerate(screenshot_urls[:5]):
+                    downloaded = download_media(img_url, game_media_dir, f"screenshot_{idx+1}.jpg")
+                    if downloaded:
+                        details["downloaded_images"].append(downloaded)
+            
+            # Download videos (max 3)
+            if details["videos"] != "N/A":
+                video_urls = details["videos"].split(", ")
+                for idx, video_url in enumerate(video_urls[:3]):
                     try:
-                        img_url = img.get_attribute("src")
-                        if img_url:
-                            screenshot_urls.append(img_url)
-                            downloaded = download_media(img_url, game_media_dir, f"screenshot_{idx+1}.jpg")
-                            if downloaded:
-                                details["downloaded_images"].append(downloaded)
-                    except:
-                        continue
-                details["screenshots"] = ", ".join(screenshot_urls) if screenshot_urls else "N/A"
-            except:
-                pass
-            
-            # Videos - Enhanced extraction
-            try:
-                video_urls = extract_video_urls(driver)
-                
-                if video_urls:
-                    details["videos"] = ", ".join(video_urls)
-                    
-                    # Download videos
-                    for idx, video_url in enumerate(video_urls):
-                        try:
-                            ext = ".webm" if ".webm" in video_url else ".mp4"
-                            downloaded = download_media(video_url, game_media_dir, f"video_{idx+1}{ext}")
-                            if downloaded:
-                                details["downloaded_videos"].append(downloaded)
-                        except Exception as e:
-                            print(f"   Failed to download video {idx+1}: {e}")
-            except Exception as e:
-                print(f"   Video extraction error: {e}")
+                        # Determine file extension
+                        if '.m3u8' in video_url or '.mpd' in video_url:
+                            ext = ".txt"  # HLS manifest info
+                        elif '.mp4' in video_url:
+                            ext = ".mp4"
+                        else:
+                            ext = ".webm"
+                        
+                        downloaded = download_media(video_url, game_media_dir, f"video_{idx+1}{ext}")
+                        if downloaded:
+                            details["downloaded_videos"].append(downloaded)
+                            print(f"      ✓ Video {idx+1} downloaded")
+                    except Exception as e:
+                        print(f"      Failed to download video {idx+1}: {e}")
         
     except Exception as e:
-        print(f"   Error scraping details for {game_title}: {e}")
+        print(f"   Error details {game_title[:30]}: {str(e)[:50]}")
     
     return details
 
-def scrape_game_element(game):
+def scrape_game_from_search(game_element):
+    """Extract game data from search result element - FAST VERSION."""
     try:
-        title = game.find_element(By.CSS_SELECTOR, ".title").text
+        # Get all text at once
+        title = game_element.locator(".title").inner_text(timeout=2000).strip()
+        
+        # Release date
+        release_date = "N/A"
         try:
-            release_date = game.find_element(By.CSS_SELECTOR, ".search_released").text
+            release_date = game_element.locator(".search_released").inner_text(timeout=500).strip()
         except:
-            release_date = "N/A"
+            pass
         
+        # Price info
         price = discount_pct = original_price = "N/A"
-        
         try:
-            discount_block = game.find_element(By.CSS_SELECTOR, ".discount_block")
-            try:
-                discount_pct = discount_block.find_element(By.CSS_SELECTOR, ".discount_pct").text.strip()
-                original_price = discount_block.find_element(By.CSS_SELECTOR, ".discount_original_price").text.strip()
-                price = discount_block.find_element(By.CSS_SELECTOR, ".discount_final_price").text.strip()
-            except:
+            if game_element.locator(".discount_block").count() > 0:
+                discount_block = game_element.locator(".discount_block").first
                 try:
-                    price = discount_block.find_element(By.CSS_SELECTOR, ".discount_final_price").text.strip()
+                    discount_pct = discount_block.locator(".discount_pct").inner_text(timeout=300).strip()
+                except:
+                    pass
+                try:
+                    original_price = discount_block.locator(".discount_original_price").inner_text(timeout=300).strip()
+                except:
+                    pass
+                try:
+                    price = discount_block.locator(".discount_final_price").inner_text(timeout=300).strip()
                 except:
                     pass
         except:
+            pass
+        
+        if price == "N/A":
             try:
-                price_text = game.find_element(By.CSS_SELECTOR, ".search_price").text.strip()
+                price_text = game_element.locator(".search_price").inner_text(timeout=500).strip()
                 price = "Free" if "Free" in price_text else (price_text if price_text else "N/A")
             except:
                 pass
         
-        # Extract review data with numerical conversion
+        # Reviews
         review_summary_text = "N/A"
         rating_score = None
         rating_percentage = None
-        
         try:
-            review_summary_element = game.find_element(By.CSS_SELECTOR, ".search_review_summary")
-            review_summary_text = review_summary_element.get_attribute("data-tooltip-html") or "N/A"
-            
-            # Convert text rating to numerical score
-            rating_score = convert_steam_rating_to_score(review_summary_text)
-            
-            # Extract percentage from tooltip
-            rating_percentage = extract_review_percentage(review_summary_text)
-            
+            if game_element.locator(".search_review_summary").count() > 0:
+                review_elem = game_element.locator(".search_review_summary").first
+                review_summary_text = review_elem.get_attribute("data-tooltip-html", timeout=300) or "N/A"
+                rating_score = convert_steam_rating_to_score(review_summary_text)
+                rating_percentage = extract_review_percentage(review_summary_text)
         except:
             pass
         
+        # URL
+        game_url = "N/A"
         try:
-            game_url = game.get_attribute("href")
+            game_url = game_element.get_attribute("href", timeout=500)
         except:
-            game_url = "N/A"
+            pass
         
+        # Platforms
         platforms = []
-        if game.find_elements(By.CSS_SELECTOR, ".platform_img.win"):
+        if game_element.locator(".platform_img.win").count() > 0:
             platforms.append("Windows")
-        if game.find_elements(By.CSS_SELECTOR, ".platform_img.mac"):
+        if game_element.locator(".platform_img.mac").count() > 0:
             platforms.append("Mac")
-        if game.find_elements(By.CSS_SELECTOR, ".platform_img.linux"):
+        if game_element.locator(".platform_img.linux").count() > 0:
             platforms.append("Linux")
         
         return {
-            "title": title, 
-            "release_date": release_date, 
-            "original_price": original_price,
-            "price": price, 
-            "discount_percentage": discount_pct, 
-            "review_summary": review_summary_text,
-            "rating_score": rating_score,  # NEW: Numerical rating (0-100)
-            "rating_percentage": rating_percentage,  # NEW: Exact percentage from Steam
-            "url": game_url, 
-            "platforms": ", ".join(platforms) if platforms else "N/A"
+            "title": title, "release_date": release_date,
+            "original_price": original_price, "price": price,
+            "discount_percentage": discount_pct, "review_summary": review_summary_text,
+            "rating_score": rating_score, "rating_percentage": rating_percentage,
+            "url": game_url, "platforms": ", ".join(platforms) if platforms else "N/A"
         }
     except:
         return None
 
 def scrape_page_range(worker_id, start_page, end_page, scrape_details=True, download_media_files=True):
-    driver = create_driver()
+    """Scrape a range of pages - OPTIMIZED VERSION."""
     local_data = []
     
-    try:
-        print(f"[Worker {worker_id}] Pages {start_page}-{end_page}")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=['--disable-blink-features=AutomationControlled', '--disable-dev-shm-usage']
+        )
+        context = browser.new_context(
+            viewport={'width': 1920, 'height': 1080},
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        )
+        page = context.new_page()
+        page.set_default_timeout(10000)  # 10s default
         
-        for page_num in range(start_page, end_page + 1):
-            try:
-                driver.get(f"https://store.steampowered.com/search/?filter=topsellers&page={page_num}")
-                WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "#search_resultsRows > a")))
-                time.sleep(2)
-                
-                games = driver.find_elements(By.CSS_SELECTOR, "#search_resultsRows > a")
-                
-                for game in games:
-                    game_data = scrape_game_element(game)
-                    if game_data:
-                        if scrape_details and game_data["url"] != "N/A":
-                            print(f"[Worker {worker_id}] Scraping: {game_data['title']} (Rating: {game_data['rating_score']})")
-                            details = scrape_game_details(driver, game_data["url"], game_data["title"], download_media_files)
-                            game_data.update(details)
-                            
-                            # Filter: Only keep games with screenshots or videos
-                            if not has_media_content(game_data.get("screenshots", "N/A"), game_data.get("videos", "N/A")):
-                                print(f"[Worker {worker_id}] ⚠️  Skipping {game_data['title']} - No media content")
+        try:
+            print(f"[Worker {worker_id}] Pages {start_page}-{end_page}")
+            
+            for page_num in range(start_page, end_page + 1):
+                try:
+                    # Navigate to search page
+                    url = f"https://store.steampowered.com/search/?filter=topsellers&page={page_num}"
+                    page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                    
+                    # Wait for search results
+                    page.wait_for_selector("#search_resultsRows", timeout=8000)
+                    time.sleep(0.3)  # Brief pause
+                    
+                    # Get ALL game elements at once
+                    game_elements = page.locator("#search_resultsRows > a").all()
+                    
+                    # Process all games on this page
+                    page_games = []
+                    for idx, game_elem in enumerate(game_elements):
+                        try:
+                            game_data = scrape_game_from_search(game_elem)
+                            if game_data and game_data["url"] != "N/A":
+                                page_games.append(game_data)
+                        except:
+                            continue
+                    
+                    print(f"[Worker {worker_id}] Page {page_num}: Found {len(page_games)} games")
+                    
+                    # Now scrape details for each game
+                    if scrape_details:
+                        for game_data in page_games:
+                            try:
+                                print(f"[Worker {worker_id}] {game_data['title'][:40]} (⭐{game_data['rating_score']})")
+                                details = scrape_game_details(page, game_data["url"], game_data["title"], download_media_files)
+                                game_data.update(details)
+                                
+                                # Filter: Only keep games with media
+                                if details["screenshots"] != "N/A" or details["videos"] != "N/A":
+                                    local_data.append(game_data)
+                                else:
+                                    print(f"[Worker {worker_id}] ⚠️ Skipped (no media)")
+                            except Exception as e:
+                                print(f"[Worker {worker_id}] Error: {str(e)[:40]}")
                                 continue
-                        
-                        local_data.append(game_data)
-                
-                print(f"[Worker {worker_id}] Page {page_num}: {len(games)} games (Total: {len(local_data)})")
-                time.sleep(1)
-                
-            except Exception as e:
-                print(f"[Worker {worker_id}] Error page {page_num}: {e}")
-                continue
-        
-        print(f"[Worker {worker_id}] ✓ Done: {len(local_data)} games")
-        
-    except Exception as e:
-        print(f"[Worker {worker_id}] Fatal: {e}")
-    finally:
-        driver.quit()
+                    else:
+                        local_data.extend(page_games)
+                    
+                    print(f"[Worker {worker_id}] Page {page_num} complete: {len(local_data)} total games")
+                    time.sleep(1)  # Rate limiting
+                    
+                except PlaywrightTimeout:
+                    print(f"[Worker {worker_id}] Timeout page {page_num}, skipping...")
+                    continue
+                except Exception as e:
+                    print(f"[Worker {worker_id}] Error page {page_num}: {str(e)[:50]}")
+                    continue
+            
+            print(f"[Worker {worker_id}] ✓ Complete: {len(local_data)} games")
+            
+        except Exception as e:
+            print(f"[Worker {worker_id}] Fatal: {str(e)[:60]}")
+        finally:
+            try:
+                context.close()
+                browser.close()
+            except:
+                pass
     
     with data_lock:
         all_game_data.extend(local_data)
@@ -563,14 +590,26 @@ def scrape_page_range(worker_id, start_page, end_page, scrape_details=True, down
     return local_data
 
 def scrape_steam_games(max_games=100, num_workers=5, scrape_details=True, download_media_files=True):
-    """Scrape Steam games using multithreading."""
+    """
+    Scrape Steam games using Playwright with multithreading - OPTIMIZED.
+    
+    Args:
+        max_games: Target number of games to scrape
+        num_workers: Number of parallel workers (recommended: 3-7)
+        scrape_details: Whether to scrape detailed game info
+        download_media_files: Whether to download media files
+    """
     global all_game_data
     all_game_data = []
     
-    print(f"🚀 Starting with {num_workers} workers | Target: {max_games} games")
-    print(f"🔍 Details: {'ON' if scrape_details else 'OFF'} | Media: {'ON' if download_media_files else 'OFF'}")
-    print(f"🎬 Filter: Games WITHOUT screenshots/videos will be DROPPED")
-    print(f"⭐ Ratings will be converted to numerical scores (0-100)\n")
+    # Optimize worker count
+    num_workers = min(num_workers, 7)
+    
+    print(f"🚀 HIGH-PERFORMANCE MODE | {num_workers} workers | Target: {max_games} games")
+    print(f"🔍 Details: {'ON' if scrape_details else 'OFF'} | Media Downloads: {'ON' if download_media_files else 'OFF'}")
+    print(f"🎬 Filter: Games WITHOUT screenshots/videos will be dropped")
+    print(f"⚡ Video extraction: Embedded videos → JSON trailers → Regex → Constructed URLs")
+    print(f"📹 Converts HLS manifests to direct .webm/.mp4 URLs\n")
     
     start_time = time.time()
     
@@ -578,7 +617,7 @@ def scrape_steam_games(max_games=100, num_workers=5, scrape_details=True, downlo
     total_pages_needed = (max_games + games_per_page - 1) // games_per_page
     pages_per_worker = max(1, total_pages_needed // num_workers)
     
-    print(f"📄 Pages needed: {total_pages_needed} | Per worker: {pages_per_worker}\n")
+    print(f"📄 Pages: {total_pages_needed} | Per worker: {pages_per_worker}\n")
     
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = []
@@ -595,7 +634,7 @@ def scrape_steam_games(max_games=100, num_workers=5, scrape_details=True, downlo
             try:
                 future.result()
             except Exception as e:
-                print(f"Worker error: {e}")
+                print(f"⚠️ Worker error: {str(e)[:60]}")
     
     elapsed = time.time() - start_time
     
@@ -604,41 +643,43 @@ def scrape_steam_games(max_games=100, num_workers=5, scrape_details=True, downlo
         initial_count = len(df)
         df = df.drop_duplicates(subset=['url'], keep='first')
         
-        # Additional filter at DataFrame level (safety check)
-        before_filter = len(df)
-        df = df[df.apply(lambda row: has_media_content(row.get("screenshots", "N/A"), row.get("videos", "N/A")), axis=1)]
-        after_filter = len(df)
-        dropped_count = before_filter - after_filter
-        
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        output_file = os.path.join(script_dir, "scraped_data", "steam_games_detailed.csv")
-        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+        output_dir = os.path.join(script_dir, "scraped_data")
+        os.makedirs(output_dir, exist_ok=True)
+        output_file = os.path.join(output_dir, "steam_games_detailed.csv")
         df.to_csv(output_file, index=False, encoding='utf-8-sig')
         
-        print(f"\n{'='*60}")
-        print(f"✅ COMPLETE | {len(df)} games | {elapsed:.1f}s | {len(df)/elapsed:.2f} games/s")
-        if dropped_count > 0:
-            print(f"🗑️  Dropped {dropped_count} games with no media content")
+        print(f"\n{'='*70}")
+        print(f"✅ COMPLETE | {len(df)} games in {elapsed:.1f}s | ⚡{len(df)/elapsed:.2f} games/s")
+        if initial_count > len(df):
+            print(f"🗑️  Removed {initial_count - len(df)} duplicates")
         print(f"💾 Saved: {output_file}")
-        print(f"{'='*60}\n")
+        print(f"{'='*70}\n")
         
-        print(df[['title', 'price', 'rating_score', 'rating_percentage', 'genres']].head(10).to_string(index=False))
+        # Show sample
+        display_cols = [col for col in ['title', 'price', 'rating_score', 'rating_percentage', 'genres'] if col in df.columns]
+        print(df[display_cols].head(10).to_string(index=False))
         
         if scrape_details:
-            print(f"\n📊 Stats:")
-            print(f"   Single-player: {len(df[df['singleplayer'] == 'Yes'])}")
-            print(f"   Multi-player: {len(df[df['multiplayer'] == 'Yes'])}")
-            print(f"   Free: {len(df[df['price'] == 'Free'])}")
-            print(f"   On sale: {len(df[df['discount_percentage'] != 'N/A'])}")
-            print(f"   With screenshots: {len(df[df['screenshots'] != 'N/A'])}")
-            print(f"   With videos: {len(df[df['videos'] != 'N/A'])}")
+            print(f"\n📊 Statistics:")
+            stats = {
+                "Single-player": len(df[df['singleplayer'] == 'Yes']),
+                "Multi-player": len(df[df['multiplayer'] == 'Yes']),
+                "Free games": len(df[df['price'] == 'Free']),
+                "On sale": len(df[df['discount_percentage'] != 'N/A']),
+                "With screenshots": len(df[df['screenshots'] != 'N/A']),
+                "With videos": len(df[df['videos'] != 'N/A'])
+            }
+            for key, val in stats.items():
+                print(f"   {key}: {val}")
             
-            # Rating statistics
             rated_games = df[df['rating_score'].notna()]
             if len(rated_games) > 0:
-                print(f"   With ratings: {len(rated_games)}")
-                print(f"   Average rating: {rated_games['rating_score'].mean():.1f}/100")
-                print(f"   Highest rated: {rated_games['rating_score'].max()}/100")
+                print(f"\n⭐ Ratings:")
+                print(f"   Games rated: {len(rated_games)}")
+                print(f"   Average: {rated_games['rating_score'].mean():.1f}/100")
+                print(f"   Highest: {rated_games['rating_score'].max()}/100")
+                print(f"   Lowest: {rated_games['rating_score'].min()}/100")
     else:
         print("❌ No games scraped")
     
@@ -646,10 +687,16 @@ def scrape_steam_games(max_games=100, num_workers=5, scrape_details=True, downlo
 
 if __name__ == "__main__":
     start = time.perf_counter()
-    # Full scrape with media (start small!)
-    scrape_steam_games(max_games=1000, num_workers=10, scrape_details=True, download_media_files=True)
+    
+    # Install: python -m playwright install chromium
+    
+    # RECOMMENDED: Start with 100 games and 5 workers
+    scrape_steam_games(
+        max_games=100,
+        num_workers=5,
+        scrape_details=True,
+        download_media_files=True
+    )
+    
     end = time.perf_counter()
-    print(f"Total execution time: {end - start:.4f} seconds")
-    # Increase number of workers above for faster scraping on powerful machines
-    # Quick scrape
-    # scrape_steam_games(max_games=1000, num_workers=10, scrape_details=False, download_media_files=False)
+    print(f"\n⏱️  Total execution: {end - start:.1f}s")
