@@ -692,8 +692,8 @@ if __name__ == "__main__":
     
     # RECOMMENDED: Start with 100 games and 5 workers
     scrape_steam_games(
-        max_games=100,
-        num_workers=5,
+        max_games=500,
+        num_workers=10,
         scrape_details=True,
         download_media_files=True
     )
