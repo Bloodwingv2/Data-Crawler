@@ -647,7 +647,7 @@ def scrape_steam_games(max_games=100, num_workers=5, scrape_details=True, downlo
 if __name__ == "__main__":
     start = time.perf_counter()
     # Full scrape with media (start small!)
-    scrape_steam_games(max_games=50, num_workers=10, scrape_details=True, download_media_files=True)
+    scrape_steam_games(max_games=1000, num_workers=10, scrape_details=True, download_media_files=True)
     end = time.perf_counter()
     print(f"Total execution time: {end - start:.4f} seconds")
     # Increase number of workers above for faster scraping on powerful machines
