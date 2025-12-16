@@ -1,17 +1,26 @@
 import sqlite3
 import csv
 import os
+import shutil
+from pathlib import Path
 
 DB_PATH = os.path.join('Database_files', 'Games_Database.db')
+MEDIA_DIR = Path('media_files')
 
 def init_db():
-    """Initialize database and create table if not exists"""
+    """Initialize database and create tables"""
     os.makedirs('Database_files', exist_ok=True)
+    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    (MEDIA_DIR / 'images').mkdir(exist_ok=True)
+    (MEDIA_DIR / 'videos').mkdir(exist_ok=True)
+    
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     
+    # Games table
     cur.execute('''
         CREATE TABLE IF NOT EXISTS games (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             data_source TEXT, game_title TEXT, release_date TEXT,
             rating INTEGER, review_count INTEGER, discounted_price REAL,
             original_price REAL, discount_percentage REAL, genres TEXT,
@@ -19,9 +28,24 @@ def init_db():
             description TEXT, release_status TEXT, game_url TEXT
         )
     ''')
+    
+    # Media files table
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS media_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            game_id INTEGER NOT NULL,
+            media_type TEXT NOT NULL,
+            file_name TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            file_size INTEGER,
+            FOREIGN KEY (game_id) REFERENCES games (id)
+        )
+    ''')
+    
     conn.commit()
     conn.close()
     print(f"✓ Database initialized: {DB_PATH}")
+    print(f"✓ Media directory: {MEDIA_DIR}")
 
 def get_record_count():
     """Get total number of records in database"""
@@ -49,7 +73,10 @@ def import_csv(csv_file='Master_Dataset_Final.csv'):
             
             for row in reader:
                 cur.execute('''
-                    INSERT INTO games VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO games (data_source, game_title, release_date, rating, review_count,
+                                     discounted_price, original_price, discount_percentage, genres,
+                                     platform, developer, publisher, description, release_status, game_url)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     row.get('data_source', ''),
                     row.get('game_title', ''),
@@ -69,35 +96,244 @@ def import_csv(csv_file='Master_Dataset_Final.csv'):
                 ))
                 imported += 1
                 if imported % 500 == 0:
-                    print(f"  Imported {imported} records...")
+                    print(f"  ✓ Imported {imported} records...")
         
         conn.commit()
-        print(f"✓ Imported {imported} games successfully")
+        print(f"✓ Successfully imported {imported} games")
     except Exception as e:
         print(f"✗ Import error: {e}")
     finally:
         conn.close()
 
+def add_media_file(game_id, media_file_path, media_type='image'):
+    """
+    Add a media file (image or video) to the database
+    
+    Args:
+        game_id: ID of the game in database
+        media_file_path: Path to the media file
+        media_type: 'image' or 'video'
+    """
+    source_path = Path(media_file_path)
+    
+    if not source_path.exists():
+        print(f"✗ File not found: {media_file_path}")
+        return False
+    
+    print(f"→ Processing {media_type}: {source_path.name}")
+    
+    # Determine destination
+    subdir = 'images' if media_type == 'image' else 'videos'
+    dest_filename = f"game_{game_id}_{source_path.name}"
+    dest_path = MEDIA_DIR / subdir / dest_filename
+    
+    try:
+        # Copy file
+        print(f"  → Copying to {dest_path.relative_to(Path.cwd())}")
+        shutil.copy2(source_path, dest_path)
+        file_size = dest_path.stat().st_size
+        
+        # Store in database
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        
+        cur.execute('''
+            INSERT INTO media_files (game_id, media_type, file_name, file_path, file_size)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (game_id, media_type, source_path.name, str(dest_path.relative_to(Path.cwd())), file_size))
+        
+        conn.commit()
+        conn.close()
+        
+        print(f"  ✓ Added {media_type}: {dest_filename} ({file_size / 1024:.2f} KB)")
+        return True
+        
+    except Exception as e:
+        print(f"  ✗ Error: {e}")
+        return False
+
+def add_media_batch(game_id, media_folder):
+    """
+    Add multiple media files from a folder
+    
+    Args:
+        game_id: ID of the game in database
+        media_folder: Path to folder containing media files
+    """
+    folder = Path(media_folder)
+    if not folder.exists():
+        print(f"✗ Folder not found: {media_folder}")
+        return
+    
+    image_exts = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'}
+    video_exts = {'.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm'}
+    
+    total_added = 0
+    print(f"\n{'='*80}")
+    print(f"Processing media files from: {media_folder}")
+    print('='*80)
+    
+    for file_path in folder.iterdir():
+        if file_path.is_file():
+            ext = file_path.suffix.lower()
+            
+            if ext in image_exts:
+                if add_media_file(game_id, file_path, 'image'):
+                    total_added += 1
+            elif ext in video_exts:
+                if add_media_file(game_id, file_path, 'video'):
+                    total_added += 1
+    
+    print(f"{'='*80}")
+    print(f"✓ Added {total_added} media files for game ID {game_id}\n")
+
+def find_game_by_title(game_title):
+    """Find game ID by matching title"""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    
+    # Try exact match first (using ROWID instead of id)
+    cur.execute('SELECT ROWID, game_title FROM games WHERE game_title = ?', (game_title,))
+    result = cur.fetchone()
+    
+    # If no exact match, try case-insensitive partial match
+    if not result:
+        cur.execute('SELECT ROWID, game_title FROM games WHERE LOWER(game_title) LIKE LOWER(?)', (f'%{game_title}%',))
+        result = cur.fetchone()
+    
+    conn.close()
+    return result
+
+def scan_and_import_all_media():
+    """Scan nested media_files directory structure and import all media files"""
+    
+    if not MEDIA_DIR.exists():
+        print(f"✗ Media directory not found: {MEDIA_DIR}")
+        return
+    
+    image_exts = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'}
+    video_exts = {'.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm'}
+    
+    total_added = 0
+    total_skipped = 0
+    
+    print(f"\n{'='*80}")
+    print("SCANNING AND IMPORTING ALL MEDIA FILES")
+    print('='*80)
+    
+    # Walk through all subdirectories in media_files
+    for root, dirs, files in os.walk(MEDIA_DIR):
+        root_path = Path(root)
+        
+        # Skip base images/videos folders
+        if root_path.name in ['images', 'videos']:
+            continue
+        
+        # Extract game title from folder structure
+        # Expected: media_files/platform_folder/Game Title/
+        folder_parts = root_path.relative_to(MEDIA_DIR).parts
+        
+        if len(folder_parts) < 2:
+            continue
+        
+        game_title = folder_parts[1]  # Game name is second level
+        
+        if not files:
+            continue
+        
+        print(f"\n→ Processing: {game_title}")
+        
+        # Find game in database
+        game_match = find_game_by_title(game_title)
+        
+        if not game_match:
+            print(f"  ✗ Not found in database: {game_title}")
+            total_skipped += len(files)
+            continue
+        
+        game_id, db_title = game_match
+        print(f"  ✓ Matched to: {db_title} (ID: {game_id})")
+        
+        # Process each media file
+        for file_name in files:
+            file_path = root_path / file_name
+            ext = file_path.suffix.lower()
+            
+            if ext in image_exts:
+                media_type = 'image'
+            elif ext in video_exts:
+                media_type = 'video'
+            else:
+                continue
+            
+            try:
+                file_size = file_path.stat().st_size
+                
+                conn = sqlite3.connect(DB_PATH)
+                cur = conn.cursor()
+                
+                cur.execute('''
+                    INSERT INTO media_files (game_id, media_type, file_name, file_path, file_size)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (game_id, media_type, file_name, str(file_path), file_size))
+                
+                conn.commit()
+                conn.close()
+                
+                total_added += 1
+                print(f"    ✓ Added {media_type}: {file_name}")
+            except Exception as e:
+                print(f"    ✗ Error: {file_name} - {e}")
+                total_skipped += 1
+    
+    print(f"\n{'='*80}")
+    print(f"✓ Import complete!")
+    print(f"  Added: {total_added} files")
+    print(f"  Skipped: {total_skipped} files")
+    print('='*80 + '\n')
+
+def get_game_media(game_id):
+    """Get all media files for a specific game"""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    
+    cur.execute('SELECT * FROM media_files WHERE game_id = ?', (game_id,))
+    media = cur.fetchall()
+    
+    conn.close()
+    return media
+
 def show_stats():
     """Display database statistics"""
-    count = get_record_count()
-    print(f"\n=== Database Statistics ===")
-    print(f"Total games: {count}")
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
     
-    # Sample games
-    samples = query_db('SELECT game_title, developer, rating FROM games LIMIT 5')
-    print("\nSample games:")
-    for title, dev, rating in samples:
-        print(f"  • {title} by {dev} (Rating: {rating})")
+    cur.execute('SELECT COUNT(*) FROM games')
+    game_count = cur.fetchone()[0]
+    
+    cur.execute('SELECT COUNT(*), SUM(file_size) FROM media_files WHERE media_type = "image"')
+    img_count, img_size = cur.fetchone()
+    
+    cur.execute('SELECT COUNT(*), SUM(file_size) FROM media_files WHERE media_type = "video"')
+    vid_count, vid_size = cur.fetchone()
+    
+    conn.close()
+    
+    print(f"\n{'='*80}")
+    print("DATABASE STATISTICS")
+    print('='*80)
+    print(f"Total games      : {game_count}")
+    print(f"Total images     : {img_count or 0} files ({(img_size or 0) / (1024*1024):.2f} MB)")
+    print(f"Total videos     : {vid_count or 0} files ({(vid_size or 0) / (1024*1024):.2f} MB)")
+    print('='*80 + '\n')
 
 def print_results(results, limit=None):
-    """Pretty print query results in a formatted table"""
+    """Pretty print query results"""
     if not results:
         print("No results found")
         return
     
-    # Column names for the games table
-    columns = ['data_source', 'game_title', 'release_date', 'rating', 'review_count',
+    columns = ['id', 'data_source', 'game_title', 'release_date', 'rating', 'review_count',
                'discounted_price', 'original_price', 'discount_percentage', 'genres',
                'platform', 'developer', 'publisher', 'description', 'release_status', 'game_url']
     
@@ -109,24 +345,20 @@ def print_results(results, limit=None):
     print('='*100)
     
     for i, row in enumerate(display, 1):
-        print(f"\n[{i}] {row[1] if len(row) > 1 else 'N/A'}")  # Game title
+        game_title = row[2] if len(row) > 2 else 'N/A'
+        print(f"\n[{i}] {game_title}")
         print('-'*100)
         
-        # Determine which columns to show based on row length
         cols_to_show = min(len(row), len(columns))
         
         for j in range(cols_to_show):
-            col_name = columns[j] if j < len(columns) else f"col_{j}"
+            col_name = columns[j]
             value = row[j]
             
-            # Skip empty or redundant fields
-            if value == '' or value is None:
+            if value == '' or value is None or col_name == 'game_title':
                 continue
             
-            # Format specific columns
-            if col_name == 'game_title':
-                continue  # Already shown as header
-            elif col_name == 'description' and isinstance(value, str):
+            if col_name == 'description' and isinstance(value, str):
                 value = value[:150] + "..." if len(value) > 150 else value
             elif col_name == 'game_url' and isinstance(value, str):
                 value = value[:80] + "..." if len(value) > 80 else value
@@ -138,14 +370,22 @@ def print_results(results, limit=None):
                 value = f"{value}/100"
             
             print(f"  {col_name:20s}: {value}")
+        
+        # Show media files if game_id available
+        if len(row) > 0:
+            media = get_game_media(row[0])
+            if media:
+                print(f"\n  {'Media files':20s}: {len(media)} files")
+                for m in media[:3]:  # Show first 3
+                    print(f"    → {m[2]}: {m[3]} ({m[5]/1024:.1f} KB)")
     
     print('='*100 + '\n')
 
-def query_db(sql):
-    """Execute a SQL query and return results"""
+def query_db(sql, params=()):
+    """Execute SQL query and return results"""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute(sql)
+    cur.execute(sql, params)
     results = cur.fetchall()
     conn.close()
     return results
@@ -154,6 +394,17 @@ def query_db(sql):
 if __name__ == "__main__":
     init_db()
     import_csv()
-    #show_stats()
-    results = query_db('SELECT * FROM games WHERE developer = "Valve"')
-    print_results(results)
+    
+    # Scan and import all media files from nested directory structure
+    scan_and_import_all_media()
+    
+    show_stats()
+    
+    # Example: Query and display results
+    print("\n=== Sample Query: Valve Games ===")
+    results = query_db('SELECT * FROM games WHERE developer = ?', ('Valve',))
+    print_results(results, limit=3)
+    
+    # Example: Add media files (uncomment to use)
+    # add_media_file(game_id=1, media_file_path='path/to/screenshot.jpg', media_type='image')
+    # add_media_batch(game_id=1, media_folder='path/to/game_media_folder')
