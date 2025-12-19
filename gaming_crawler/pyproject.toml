@@ -1,11 +1,16 @@
 [project]
 name = "Gaming-crawler"
 version = "0.1.0"
-description = "Experimental web crawler for gaming websites using Selenium."
+description = "Completed Gaming crawler using Playwright (Previously Selenium)."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "pandas>=2.3.3",
+    "playwright>=1.57.0",
     "selenium>=4.39.0",
+    "undetected-chromedriver>=3.5.5",
     "webdriver-manager>=4.0.2",
 ]
+
+    INPUT_FILE = "scraped_data/prime_data.csv"
+    OUTPUT_FILE = "scraped_data/Master_Dataset_cleaned.csv"
